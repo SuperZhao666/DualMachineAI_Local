@@ -114,6 +114,30 @@ struct HostFirewallProvisioningResult {
     std::string detail;
 };
 
+struct HostFirewallStoredRule {
+    bool readable{};
+    HostFirewallRuleSnapshot snapshot;
+};
+struct HostFirewallAuditedRule {
+    HostFirewallRuleAuditEntry audit;
+    bool readable{};
+    HostFirewallRuleSnapshot snapshot;
+};
+/** The same reconciliation engine uses COM in production and an isolated store in tests. */
+class HostFirewallRuleStore {
+public:
+    virtual ~HostFirewallRuleStore()=default;
+    virtual bool audit_entries(std::vector<HostFirewallAuditedRule>&,std::string&)=0;
+    virtual bool enumerate_named(std::wstring_view,std::vector<HostFirewallStoredRule>&,std::string&)=0;
+    virtual bool prepare(const HostFirewallRuleSnapshot&,std::string&)=0;
+    virtual bool remove(std::wstring_view,std::string&)=0;
+    virtual bool add(const HostFirewallRuleSnapshot&,std::string&)=0;
+};
+[[nodiscard]] bool host_firewall_rule_name_is_recognized(
+    const HostFirewallRulePolicy& desired,std::wstring_view name) noexcept;
+[[nodiscard]] HostFirewallProvisioningResult reconcile_host_firewall_rule_store(
+    std::wstring application_path,HostFirewallRuleStore& store,bool may_mutate);
+
 /**
  * Reconciles only the VisionForge-owned CAT6 and on-link LAN/Wi-Fi UDP rules. It
  * never changes firewall defaults or unrelated rules.

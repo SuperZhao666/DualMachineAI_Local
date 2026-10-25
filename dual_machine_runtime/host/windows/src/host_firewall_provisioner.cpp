@@ -72,10 +72,7 @@ struct ComApartment final {
     HRESULT result{};
 };
 
-struct EnumeratedRule final {
-    bool readable{};
-    HostFirewallRuleSnapshot snapshot;
-};
+using EnumeratedRule=HostFirewallStoredRule;
 
 struct RuleReconciliationPlan final {
     HostFirewallRulePolicy desired;
@@ -642,13 +639,17 @@ HRESULT enumerate_rules_named(
         VariantInit(&item);
         ULONG fetched{};
         result = enumerator->Next(1U, &item, &fetched);
-        if (result == S_FALSE || fetched == 0U) {
-            VariantClear(&item);
-            return S_OK;
-        }
         if (FAILED(result)) {
             VariantClear(&item);
             return result;
+        }
+        if (result == S_FALSE) {
+            VariantClear(&item);
+            return fetched == 0U ? S_OK : E_UNEXPECTED;
+        }
+        if (fetched != 1U) {
+            VariantClear(&item);
+            return E_UNEXPECTED;
         }
         ComPtr<INetFwRule> base_rule;
         if (item.vt == VT_DISPATCH && item.pdispVal != nullptr) {
@@ -730,11 +731,11 @@ HRESULT read_rule_audit_entry(INetFwRule* rule, HostFirewallRuleAuditEntry& entr
     return S_OK;
 }
 
-HRESULT find_conflicting_executable_rules(
+HRESULT read_executable_rule_audits(
     INetFwRules* rules,
     const std::wstring& executable_path,
     const std::vector<HostFirewallRulePolicy>& owned_rules,
-    std::vector<std::wstring>& conflicts) {
+    std::vector<HostFirewallAuditedRule>& entries) {
     if (rules == nullptr) return E_POINTER;
     ComPtr<IUnknown> unknown_enumerator;
     HRESULT result = rules->get__NewEnum(&unknown_enumerator);
@@ -752,13 +753,17 @@ HRESULT find_conflicting_executable_rules(
         VariantInit(&item);
         ULONG fetched{};
         result = enumerator->Next(1U, &item, &fetched);
-        if (result == S_FALSE || fetched == 0U) {
-            VariantClear(&item);
-            return S_OK;
-        }
         if (FAILED(result)) {
             VariantClear(&item);
             return result;
+        }
+        if (result == S_FALSE) {
+            VariantClear(&item);
+            return fetched == 0U ? S_OK : E_UNEXPECTED;
+        }
+        if (fetched != 1U) {
+            VariantClear(&item);
+            return E_UNEXPECTED;
         }
         ComPtr<INetFwRule> rule;
         if (item.vt == VT_DISPATCH && item.pdispVal != nullptr) {
@@ -775,21 +780,13 @@ HRESULT find_conflicting_executable_rules(
         HostFirewallRuleAuditEntry entry{};
         result = read_rule_audit_entry(rule.Get(), entry);
         if (FAILED(result)) return result;
-        if (host_firewall_rule_is_conflicting_executable_allow(
-                executable_path, owned_rules, entry)) {
-            conflicts.push_back(std::move(entry.name));
-            continue;
-        }
-        const bool relevant_allow = entry.inbound && entry.enabled && entry.allow &&
-            equals_insensitive(executable_path, entry.application_path);
-        if (!relevant_allow) continue;
-        const auto desired = std::find_if(
-            owned_rules.begin(), owned_rules.end(), [&](const auto& candidate) {
-                return equals_insensitive(candidate.name, entry.name);
-            });
-        if (desired == owned_rules.end()) {
-            conflicts.push_back(std::move(entry.name));
-            continue;
+        const bool relevant_allow=entry.inbound && entry.enabled && entry.allow &&
+            equals_insensitive(executable_path,entry.application_path);
+        const bool recognized=std::any_of(owned_rules.begin(),owned_rules.end(),[&](const auto& desired) {
+            return host_firewall_rule_name_is_recognized(desired,entry.name);
+        });
+        if(!relevant_allow || !recognized) {
+            entries.push_back({std::move(entry),false,{}});continue;
         }
         ComPtr<INetFwRule3> rule3;
         HostFirewallRuleSnapshot snapshot{};
@@ -798,10 +795,30 @@ HRESULT find_conflicting_executable_rules(
             !read_rule_snapshot(rule3.Get(), snapshot)) {
             return FAILED(result) ? result : E_FAIL;
         }
-        if (!firewall_rule_is_owned(*desired, snapshot)) {
-            conflicts.push_back(std::move(entry.name));
-        }
+        entries.push_back({std::move(entry),true,std::move(snapshot)});
     }
+}
+
+bool find_conflicting_executable_rules(HostFirewallRuleStore& store,
+    const std::wstring& executable_path,const std::vector<HostFirewallRulePolicy>& owned_rules,
+    std::vector<std::wstring>& conflicts,std::string& detail) {
+    std::vector<HostFirewallAuditedRule> entries;
+    if(!store.audit_entries(entries,detail))return false;
+    for(const auto& record:entries) {
+        const auto& entry=record.audit;
+        if(host_firewall_rule_is_conflicting_executable_allow(executable_path,owned_rules,entry)) {
+            conflicts.push_back(entry.name);continue;
+        }
+        if(!entry.inbound || !entry.enabled || !entry.allow ||
+            !equals_insensitive(executable_path,entry.application_path))continue;
+        const auto desired=std::find_if(owned_rules.begin(),owned_rules.end(),[&](const auto& candidate) {
+            return host_firewall_rule_name_is_recognized(candidate,entry.name);
+        });
+        if(desired==owned_rules.end()){conflicts.push_back(entry.name);continue;}
+        if(!record.readable){detail="stage=audit_executable_rules unreadable_snapshot";return false;}
+        if(!firewall_rule_is_owned(*desired,record.snapshot))conflicts.push_back(entry.name);
+    }
+    return true;
 }
 
 template <typename Interface>
@@ -1119,18 +1136,13 @@ bool snapshot_multiset_equal(
 }
 
 bool collect_owned_snapshots(
-    INetFwRules* rules,
+    HostFirewallRuleStore& store,
     const HostFirewallRulePolicy& desired,
     std::vector<HostFirewallRuleSnapshot>& snapshots,
     std::string& detail) {
     const auto collect_name = [&](std::wstring_view name) {
         std::vector<EnumeratedRule> matches;
-        const HRESULT result = enumerate_rules_named(rules, name, matches);
-        if (FAILED(result)) {
-            detail = "stage=enumerate_rule rule=" + narrow_utf8(name) +
-                " " + format_hresult(result);
-            return false;
-        }
+        if(!store.enumerate_named(name,matches,detail))return false;
         for (std::size_t index = 0; index < matches.size(); ++index) {
             if (!matches[index].readable) {
                 detail = "stage=ownership_validation rule=" + narrow_utf8(name) +
@@ -1138,7 +1150,8 @@ bool collect_owned_snapshots(
                     " reason=unreadable_same_name_rule";
                 return false;
             }
-            if (!firewall_rule_is_owned(desired, matches[index].snapshot)) {
+            if (!host_firewall_rule_name_is_recognized(desired,matches[index].snapshot.name) ||
+                !firewall_rule_is_owned(desired, matches[index].snapshot)) {
                 detail = "stage=ownership_validation rule=" + narrow_utf8(name) +
                     " index=" + std::to_string(index) +
                     " reason=ambiguous_same_name_rule mismatch=" +
@@ -1172,7 +1185,7 @@ HRESULT remove_rule_name(INetFwRules* rules, std::wstring_view name) {
 }
 
 bool remove_all_owned_named_rules(
-    INetFwRules* rules,
+    HostFirewallRuleStore& store,
     const HostFirewallRulePolicy& desired,
     const std::vector<HostFirewallRuleSnapshot>& allowed,
     std::uint32_t& removed,
@@ -1182,7 +1195,7 @@ bool remove_all_owned_named_rules(
     std::size_t attempts{};
     for (;;) {
         std::vector<HostFirewallRuleSnapshot> current;
-        if (!collect_owned_snapshots(rules, desired, current, detail)) return false;
+        if (!collect_owned_snapshots(store, desired, current, detail)) return false;
         if (current.empty()) return true;
         if (attempts >= maximum_attempts) {
             detail = "stage=remove_rule rule=" + narrow_utf8(desired.name) +
@@ -1200,14 +1213,9 @@ bool remove_all_owned_named_rules(
         const std::size_t before = current.size();
         ++attempts;
         const std::wstring removal_name = current.front().name;
-        const HRESULT result = remove_rule_name(rules, removal_name);
-        if (FAILED(result)) {
-            detail = "stage=remove_rule rule=" + narrow_utf8(removal_name) +
-                " before=" + std::to_string(before) + " " + format_hresult(result);
-            return false;
-        }
+        if(!store.remove(removal_name,detail))return false;
         current.clear();
-        if (!collect_owned_snapshots(rules, desired, current, detail)) return false;
+        if (!collect_owned_snapshots(store, desired, current, detail)) return false;
         if (current.size() >= before) {
             detail = "stage=remove_rule rule=" + narrow_utf8(desired.name) +
                 " reason=count_not_decreased before=" + std::to_string(before) +
@@ -1219,13 +1227,13 @@ bool remove_all_owned_named_rules(
 }
 
 bool verify_rule_plans(
-    INetFwRules* rules,
+    HostFirewallRuleStore& store,
     const std::vector<RuleReconciliationPlan>& plans,
     bool verify_original,
     std::string& detail) {
     for (const auto& plan : plans) {
         std::vector<HostFirewallRuleSnapshot> current;
-        if (!collect_owned_snapshots(rules, plan.desired, current, detail)) return false;
+        if (!collect_owned_snapshots(store, plan.desired, current, detail)) return false;
         if (verify_original) {
             if (!snapshot_multiset_equal(plan.original, current)) {
                 detail = "stage=rollback_verify rule=" + narrow_utf8(plan.desired.name) +
@@ -1246,7 +1254,7 @@ bool verify_rule_plans(
 }
 
 bool rollback_rule_plans(
-    INetFwRules* rules,
+    HostFirewallRuleStore& store,
     const std::vector<RuleReconciliationPlan>& plans,
     const std::vector<std::size_t>& touched,
     std::string& detail) {
@@ -1259,33 +1267,72 @@ bool rollback_rule_plans(
         std::uint32_t ignored{};
         std::string operation_detail;
         if (!remove_all_owned_named_rules(
-                rules, plan.desired, allowed, ignored, operation_detail)) {
+                store, plan.desired, allowed, ignored, operation_detail)) {
             succeeded = false;
             if (first_failure.empty()) first_failure = std::move(operation_detail);
             continue;
         }
         for (const auto& snapshot : plan.original) {
-            ComPtr<INetFwRule3> restored;
-            HRESULT result = create_rule_from_snapshot(snapshot, restored);
-            if (SUCCEEDED(result) && restored != nullptr) result = rules->Add(restored.Get());
-            if (FAILED(result)) {
+            if (!store.add(snapshot,operation_detail)) {
                 succeeded = false;
                 if (first_failure.empty()) {
                     first_failure = "stage=rollback_restore rule=" +
-                        narrow_utf8(plan.desired.name) + " " + format_hresult(result);
+                        narrow_utf8(plan.desired.name) + " " + operation_detail;
                 }
                 break;
             }
         }
     }
     std::string verify_detail;
-    if (!verify_rule_plans(rules, plans, true, verify_detail)) {
+    if (!verify_rule_plans(store, plans, true, verify_detail)) {
         succeeded = false;
         if (first_failure.empty()) first_failure = std::move(verify_detail);
     }
     detail = succeeded ? "rollback=complete" : "rollback=failed " + first_failure;
     return succeeded;
 }
+
+class ComFirewallRuleStore final : public HostFirewallRuleStore {
+public:
+    ComFirewallRuleStore(INetFwRules* rules,std::wstring executable,std::vector<HostFirewallRulePolicy> desired)
+        :rules_(rules),executable_(std::move(executable)),desired_(std::move(desired)){}
+    bool audit_entries(std::vector<HostFirewallAuditedRule>& entries,std::string& detail) override {
+        const auto result=read_executable_rule_audits(rules_,executable_,desired_,entries);
+        if(FAILED(result))detail="stage=audit_executable_rules "+format_hresult(result);
+        return SUCCEEDED(result);
+    }
+    bool enumerate_named(std::wstring_view name,std::vector<HostFirewallStoredRule>& entries,std::string& detail) override {
+        const auto result=enumerate_rules_named(rules_,name,entries);
+        if(FAILED(result))detail="stage=enumerate_rule "+format_hresult(result);
+        return SUCCEEDED(result);
+    }
+    bool prepare(const HostFirewallRuleSnapshot& snapshot,std::string& detail) override {
+        ComPtr<INetFwRule3> rule;
+        const auto result=create_rule_from_snapshot(snapshot,rule);
+        if(FAILED(result) || !rule){detail="stage=create_rule "+format_hresult(result);return false;}
+        prepared_.push_back({snapshot,std::move(rule)});return true;
+    }
+    bool remove(std::wstring_view name,std::string& detail) override {
+        const auto result=remove_rule_name(rules_,name);
+        if(FAILED(result))detail="stage=remove_rule "+format_hresult(result);
+        return SUCCEEDED(result);
+    }
+    bool add(const HostFirewallRuleSnapshot& snapshot,std::string& detail) override {
+        ComPtr<INetFwRule3> rule;
+        const auto found=std::find_if(prepared_.begin(),prepared_.end(),[&](const auto& entry){return snapshots_equal(snapshot,entry.first);});
+        HRESULT result=S_OK;
+        if(found!=prepared_.end())rule=found->second;
+        else result=create_rule_from_snapshot(snapshot,rule);
+        if(SUCCEEDED(result) && rule)result=rules_->Add(rule.Get());
+        if(FAILED(result) || !rule){detail="stage=add_rule "+format_hresult(result);return false;}
+        return true;
+    }
+private:
+    INetFwRules* rules_;
+    std::wstring executable_;
+    std::vector<HostFirewallRulePolicy> desired_;
+    std::vector<std::pair<HostFirewallRuleSnapshot,ComPtr<INetFwRule3>>> prepared_;
+};
 
 }  // namespace
 
@@ -1406,6 +1453,127 @@ bool host_firewall_rule_is_conflicting_executable_allow(
     });
 }
 
+bool host_firewall_rule_name_is_recognized(const HostFirewallRulePolicy& desired,std::wstring_view name) noexcept {
+    if(equals_insensitive(desired.name,name))return true;
+    const auto legacy=legacy_rule_branding(desired.name);
+    return legacy.has_value() && equals_insensitive(legacy->name,name);
+}
+
+HostFirewallProvisioningResult reconcile_host_firewall_rule_store(
+    std::wstring application_path,HostFirewallRuleStore& store,bool may_mutate) {
+    HostFirewallProvisioningResult outcome{};
+    const auto with_profiles=[](std::string value){return value;};
+    const auto desired_rules = build_host_firewall_policy(application_path);
+    std::vector<std::wstring> conflicting_rules;
+    std::string operation_detail;
+    if (!find_conflicting_executable_rules(store,application_path,desired_rules,conflicting_rules,operation_detail)) {
+        outcome.status = HostFirewallStatus::failed;
+        outcome.detail = with_profiles(
+            "stage=audit_executable_rules "+operation_detail);
+        return outcome;
+    }
+    if (!conflicting_rules.empty()) {
+        outcome.status = HostFirewallStatus::failed;
+        outcome.detail = with_profiles(
+            "stage=audit_executable_rules reason=extra_enabled_inbound_allow names=" +
+            join_rule_names(conflicting_rules));
+        return outcome;
+    }
+    std::vector<RuleReconciliationPlan> plans;
+    plans.reserve(desired_rules.size());
+    for (const auto& desired : desired_rules) {
+        RuleReconciliationPlan plan{};
+        plan.desired = desired;
+        std::string preflight_detail;
+        if (!collect_owned_snapshots(
+                store, desired, plan.original, preflight_detail)) {
+            outcome.status = HostFirewallStatus::failed;
+            outcome.detail = with_profiles(std::move(preflight_detail));
+            return outcome;
+        }
+        ++outcome.checked_rules;
+        plan.needs_reconciliation =
+            !host_firewall_rule_set_is_current(desired, plan.original);
+        plans.push_back(std::move(plan));
+    }
+    const std::size_t stale_count = static_cast<std::size_t>(std::count_if(
+        plans.begin(), plans.end(), [](const auto& plan) {
+            return plan.needs_reconciliation;
+        }));
+    if (stale_count == 0U) {
+        outcome.status = HostFirewallStatus::ready;
+        outcome.detail = with_profiles(
+            "stage=complete result=rules_current checked=" +
+            std::to_string(desired_rules.size()) + "");
+        return outcome;
+    }
+    if (!may_mutate) {
+        outcome.status = HostFirewallStatus::requires_elevation;
+        outcome.detail = with_profiles(
+            "stage=reconcile result=elevation_required stale=" +
+            std::to_string(stale_count));
+        return outcome;
+    }
+
+    for(const auto& plan:plans)if(plan.needs_reconciliation &&
+        !store.prepare(snapshot_from_policy(plan.desired),operation_detail)) {
+        outcome.status=HostFirewallStatus::failed;outcome.detail=operation_detail;return outcome;
+    }
+    std::vector<std::size_t> touched;
+    std::uint32_t removed_rules{};
+    for (std::size_t index = 0; index < plans.size(); ++index) {
+        auto& plan = plans[index];
+        if (!plan.needs_reconciliation) continue;
+        touched.push_back(index);
+        std::string primary_detail;
+        if (!remove_all_owned_named_rules(
+                store, plan.desired, plan.original,
+                removed_rules, primary_detail)) {
+            outcome.status = HostFirewallStatus::failed;
+            std::string rollback_detail;
+            (void)rollback_rule_plans(store, plans, touched, rollback_detail);
+            outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
+            return outcome;
+        }
+        if (!store.add(snapshot_from_policy(plan.desired),operation_detail)) {
+            outcome.status = HostFirewallStatus::failed;
+            primary_detail = "stage=add_rule rule=" + narrow_utf8(plan.desired.name) +
+                " " + operation_detail;
+            std::string rollback_detail;
+            (void)rollback_rule_plans(store, plans, touched, rollback_detail);
+            outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
+            return outcome;
+        }
+        ++outcome.changed_rules;
+    }
+    std::string verify_detail;
+    if (!verify_rule_plans(store, plans, false, verify_detail)) {
+        outcome.status = HostFirewallStatus::failed;
+        std::string rollback_detail;
+        (void)rollback_rule_plans(store, plans, touched, rollback_detail);
+        outcome.detail = with_profiles(verify_detail + " " + rollback_detail);
+        return outcome;
+    }
+    conflicting_rules.clear();
+    const bool audited=find_conflicting_executable_rules(store,application_path,desired_rules,conflicting_rules,operation_detail);
+    if (!audited || !conflicting_rules.empty()) {
+        outcome.status = HostFirewallStatus::failed;
+        const std::string primary_detail = !audited
+            ? "stage=post_commit_audit "+operation_detail
+            : "stage=post_commit_audit reason=extra_enabled_inbound_allow names="+join_rule_names(conflicting_rules);
+        std::string rollback_detail;
+        (void)rollback_rule_plans(store, plans, touched, rollback_detail);
+        outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
+        return outcome;
+    }
+    outcome.status = HostFirewallStatus::provisioned;
+    outcome.detail = with_profiles("stage=complete result=rules_reconciled changed=" +
+        std::to_string(outcome.changed_rules) +
+        " removed=" + std::to_string(removed_rules) +
+        "");
+    return outcome;
+}
+
 HostFirewallProvisioningResult ensure_host_firewall_rules() {
     HostFirewallProvisioningResult outcome{};
     std::string executable_error;
@@ -1457,130 +1625,11 @@ HostFirewallProvisioningResult ensure_host_firewall_rules() {
         return outcome;
     }
 
-    const auto desired_rules = build_host_firewall_policy(*executable_path);
-    std::vector<std::wstring> conflicting_rules;
-    result = find_conflicting_executable_rules(
-        rules.Get(), *executable_path, desired_rules, conflicting_rules);
-    if (FAILED(result)) {
-        outcome.status = HostFirewallStatus::failed;
-        outcome.detail = with_profiles(
-            "stage=audit_executable_rules " + format_hresult(result));
-        return outcome;
-    }
-    if (!conflicting_rules.empty()) {
-        outcome.status = HostFirewallStatus::failed;
-        outcome.detail = with_profiles(
-            "stage=audit_executable_rules reason=extra_enabled_inbound_allow names=" +
-            join_rule_names(conflicting_rules));
-        return outcome;
-    }
-    std::vector<RuleReconciliationPlan> plans;
-    plans.reserve(desired_rules.size());
-    for (const auto& desired : desired_rules) {
-        RuleReconciliationPlan plan{};
-        plan.desired = desired;
-        std::string preflight_detail;
-        if (!collect_owned_snapshots(
-                rules.Get(), desired, plan.original, preflight_detail)) {
-            outcome.status = HostFirewallStatus::failed;
-            outcome.detail = with_profiles(std::move(preflight_detail));
-            return outcome;
-        }
-        ++outcome.checked_rules;
-        plan.needs_reconciliation =
-            !host_firewall_rule_set_is_current(desired, plan.original);
-        plans.push_back(std::move(plan));
-    }
-    const std::size_t stale_count = static_cast<std::size_t>(std::count_if(
-        plans.begin(), plans.end(), [](const auto& plan) {
-            return plan.needs_reconciliation;
-        }));
-    if (stale_count == 0U) {
-        outcome.status = HostFirewallStatus::ready;
-        outcome.detail = with_profiles(
-            "stage=complete result=rules_current checked=" +
-            std::to_string(desired_rules.size()) + " filtering=" +
-            std::string(filtering_inactive ? "inactive" : "active_or_transitional"));
-        return outcome;
-    }
-    if (!process_is_elevated()) {
-        outcome.status = HostFirewallStatus::requires_elevation;
-        outcome.detail = with_profiles(
-            "stage=reconcile result=elevation_required stale=" +
-            std::to_string(stale_count));
-        return outcome;
-    }
-
-    std::vector<ComPtr<INetFwRule3>> replacements(plans.size());
-    for (std::size_t index = 0; index < plans.size(); ++index) {
-        if (!plans[index].needs_reconciliation) continue;
-        if (FAILED(result = create_rule(plans[index].desired, replacements[index])) ||
-            replacements[index] == nullptr) {
-            outcome.status = HostFirewallStatus::failed;
-            outcome.detail = with_profiles("stage=create_rule rule=" +
-                narrow_utf8(plans[index].desired.name) +
-                " " + format_hresult(result));
-            return outcome;
-        }
-    }
-
-    std::vector<std::size_t> touched;
-    std::uint32_t removed_rules{};
-    for (std::size_t index = 0; index < plans.size(); ++index) {
-        auto& plan = plans[index];
-        if (!plan.needs_reconciliation) continue;
-        touched.push_back(index);
-        std::string primary_detail;
-        if (!remove_all_owned_named_rules(
-                rules.Get(), plan.desired, plan.original,
-                removed_rules, primary_detail)) {
-            outcome.status = HostFirewallStatus::failed;
-            std::string rollback_detail;
-            (void)rollback_rule_plans(rules.Get(), plans, touched, rollback_detail);
-            outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
-            return outcome;
-        }
-        result = rules->Add(replacements[index].Get());
-        if (FAILED(result)) {
-            outcome.status = HostFirewallStatus::failed;
-            primary_detail = "stage=add_rule rule=" + narrow_utf8(plan.desired.name) +
-                " " + format_hresult(result);
-            std::string rollback_detail;
-            (void)rollback_rule_plans(rules.Get(), plans, touched, rollback_detail);
-            outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
-            return outcome;
-        }
-        ++outcome.changed_rules;
-    }
-    std::string verify_detail;
-    if (!verify_rule_plans(rules.Get(), plans, false, verify_detail)) {
-        outcome.status = HostFirewallStatus::failed;
-        std::string rollback_detail;
-        (void)rollback_rule_plans(rules.Get(), plans, touched, rollback_detail);
-        outcome.detail = with_profiles(verify_detail + " " + rollback_detail);
-        return outcome;
-    }
-    conflicting_rules.clear();
-    result = find_conflicting_executable_rules(
-        rules.Get(), *executable_path, desired_rules, conflicting_rules);
-    if (FAILED(result) || !conflicting_rules.empty()) {
-        outcome.status = HostFirewallStatus::failed;
-        const std::string primary_detail = FAILED(result)
-            ? "stage=post_commit_audit " + format_hresult(result)
-            : "stage=post_commit_audit reason=extra_enabled_inbound_allow names=" +
-                join_rule_names(conflicting_rules);
-        std::string rollback_detail;
-        (void)rollback_rule_plans(rules.Get(), plans, touched, rollback_detail);
-        outcome.detail = with_profiles(primary_detail + " " + rollback_detail);
-        return outcome;
-    }
-    outcome.status = HostFirewallStatus::provisioned;
-    outcome.detail = with_profiles("stage=complete result=rules_reconciled changed=" +
-        std::to_string(outcome.changed_rules) +
-        " removed=" + std::to_string(removed_rules) +
-        " filtering=" +
-        std::string(filtering_inactive ? "inactive" : "active_or_transitional"));
-    return outcome;
+    const auto desired_rules=build_host_firewall_policy(*executable_path);
+    ComFirewallRuleStore store(rules.Get(),*executable_path,desired_rules);
+    auto reconciled=reconcile_host_firewall_rule_store(*executable_path,store,process_is_elevated());
+    reconciled.detail=with_profiles(std::move(reconciled.detail));
+    return reconciled;
 }
 
 bool host_firewall_is_ready(HostFirewallStatus status) noexcept {
