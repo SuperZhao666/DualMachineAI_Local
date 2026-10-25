@@ -1040,7 +1040,12 @@ HostRuntimeService::HostRuntimeService(IsolatedDhcpServer* isolated_dhcp_server)
 }
 HostRuntimeService::~HostRuntimeService() { stop(); }
 
-bool HostRuntimeService::start(const HostStreamSettings& settings, std::string& error) {
+bool HostRuntimeService::start(const HostStreamSettings& settings, std::string& error,
+                               std::stop_token operation_stop_token) {
+    if (operation_stop_token.stop_requested()) {
+        error = kHostStartupCancelledError;
+        return false;
+    }
     stop();
     const std::uint64_t roi_right = static_cast<std::uint64_t>(settings.capture_region.x) +
         settings.capture_region.width;
@@ -1082,6 +1087,9 @@ bool HostRuntimeService::start(const HostStreamSettings& settings, std::string& 
         startup_stop_source_ = std::stop_source{};
     }
     const std::stop_token startup_token = startup_stop_source_.get_token();
+    // The caller creates this operation token before launching its worker.
+    // Registering after reset also propagates a stop that arrived before start.
+    std::stop_callback operation_stop(operation_stop_token, [this] { request_stop(); });
     try {
         worker_ = std::thread([this, settings, startup_token] {
             g_host_attempt_id = allocate_host_attempt_id();
@@ -1196,6 +1204,17 @@ std::string HostRuntimeService::last_error() const {
 }
 
 void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startup_stop_token) {
+    const auto finish_cancelled_start = [&] {
+        std::lock_guard lock(mutex_);
+        last_error_ = kHostStartupCancelledError;
+        running_ = false;
+        start_finished_ = true;
+        start_condition_.notify_all();
+    };
+    if (startup_stop_token.stop_requested()) {
+        finish_cancelled_start();
+        return;
+    }
     {
         std::ostringstream detail;
         detail << "display_id=" << settings.display_id
@@ -1341,6 +1360,10 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
                     " firewall_detail={" + wireless_firewall.detail +
                     "} discovery={" + wireless_discovery_diagnostic + '}');
     }
+    if (startup_stop_token.stop_requested()) {
+        finish_cancelled_start();
+        return;
+    }
     if (!selected_mobile.has_value()) {
         std::lock_guard lock(mutex_);
         if (bootstrap_failure_stage == HostCat6BootstrapFailureStage::direct_link) {
@@ -1418,6 +1441,10 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
         return;
     }
     HostApplication application;
+    if (startup_stop_token.stop_requested()) {
+        finish_cancelled_start();
+        return;
+    }
     if (!application.start(create_runtime_config(
             settings, metrics_path))) {
         std::lock_guard lock(mutex_);
@@ -1446,6 +1473,13 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
         };
     {
         std::lock_guard lock(mutex_);
+        if (startup_stop_token.stop_requested()) {
+            application.stop();
+            last_error_ = kHostStartupCancelledError;
+            start_finished_ = true;
+            start_condition_.notify_all();
+            return;
+        }
         running_ = true;
         start_finished_ = true;
     }
@@ -1996,7 +2030,7 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
                                 recovery_wireless_firewall.status)) {
                             WirelessLanDiscoveryOutcome wireless_discovery =
                                 discover_wireless_lan_mobile_session(
-                                    kWirelessLanDiscoveryTimeout);
+                                    kWirelessLanDiscoveryTimeout, startup_stop_token);
                             recovered_session = std::move(wireless_discovery.session);
                             recovery_wireless_discovery =
                                 std::move(wireless_discovery.diagnostic);
@@ -2011,6 +2045,7 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
                                 : describe_firewall(recovery_wireless_firewall) +
                                     " discovery={" + recovery_wireless_discovery + "}");
                     }
+                    if (startup_stop_token.stop_requested()) break;
                     if (!recovered_session.has_value()) {
                         const HostCat6BootstrapFailureStage recovery_failure_stage =
                             classify_host_cat6_bootstrap_failure(recovered_link);
@@ -2072,6 +2107,7 @@ void HostRuntimeService::run(HostStreamSettings settings, std::stop_token startu
                         " " + recovery_detail);
                 continue;
             }
+            if (startup_stop_token.stop_requested()) break;
             if (!application.start(create_runtime_config(
                     settings, metrics_path))) {
                 recovery_stage = "runtime_initialize";

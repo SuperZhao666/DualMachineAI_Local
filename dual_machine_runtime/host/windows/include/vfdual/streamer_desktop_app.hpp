@@ -5,6 +5,7 @@
 #include "vfdual/host_idle_ui_state.hpp"
 #include "vfdual/host_ui_phase.hpp"
 #include "vfdual/host_ui_telemetry.hpp"
+#include "vfdual/host_operation_ownership.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -194,10 +195,12 @@ private:
     std::deque<std::wstring> recent_events_;
     std::thread startup_thread_;
     std::thread mobile_refresh_thread_;
+    std::stop_source startup_operation_stop_source_;
     std::stop_source mobile_refresh_stop_source_;
     std::atomic_bool mobile_refresh_finished_{true};
     std::uint64_t startup_generation_{};
-    std::uint64_t mobile_refresh_generation_{};
+    std::uint64_t startup_worker_generation_{};
+    HostOperationOwnership mobile_refresh_operation_;
     std::uint64_t last_event_frame_{};
     std::uint32_t last_recovery_count_{};
     std::chrono::steady_clock::time_point retry_not_before_{};

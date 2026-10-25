@@ -78,10 +78,28 @@ int main() {
     };
     const auto e_drive_routed_plan =
         vfdual::choose_host_direct_link_plan(e_drive_routed_dhcp);
-    CHECK(e_drive_routed_plan.downstream_adapter == 0U);
-    CHECK(!e_drive_routed_plan.downstream_already_ready);
-    CHECK(e_drive_routed_plan.reason ==
-          "isolated_routed_dhcp_wired_adapter_selected");
+    CHECK(!e_drive_routed_plan.downstream_adapter.has_value());
+    // A normal router's only DHCP Ethernet uplink is never implicit ownership.
+    auto router_lan = e_drive_routed_dhcp;
+    router_lan.resize(1);
+    router_lan[0].ipv4_gateways = {"192.168.1.1"};
+    router_lan[0].ipv4_addresses[0].address = "192.168.1.100";
+    CHECK(!vfdual::choose_host_direct_link_plan(router_lan).downstream_adapter);
+    router_lan.push_back(direct_pair[0]);
+    CHECK(vfdual::choose_host_direct_link_plan(router_lan).downstream_adapter == 1U);
+
+    auto restored_dhcp = router_lan[0];
+    CHECK(vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wired", true));
+    CHECK(!vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wrong-id", true));
+    CHECK(!vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wired", false));
+    restored_dhcp.ipv4_addresses.push_back({.address = "10.57.23.1"});
+    CHECK(!vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wired", true));
+    restored_dhcp.ipv4_addresses.pop_back();
+    restored_dhcp.dhcp_enabled = false;
+    CHECK(!vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wired", true));
+    restored_dhcp.dhcp_enabled = true;
+    restored_dhcp.hardware_interface = false;
+    CHECK(!vfdual::host_direct_link_restored_address_matches(restored_dhcp, "wired", true));
 
     auto isolated_adapters_only = direct_pair;
     isolated_adapters_only.pop_back();

@@ -64,6 +64,11 @@ struct HostDirectLinkPlan {
 [[nodiscard]] bool host_direct_link_has_any_isolated_address(
     const HostNetworkAdapterProfile& adapter) noexcept;
 
+/** Pure observation only: a restored DHCP lease may legitimately carry a route. */
+[[nodiscard]] bool host_direct_link_restored_address_matches(
+    const HostNetworkAdapterProfile& adapter, const std::string& snapshot_adapter_id,
+    bool originally_dhcp) noexcept;
+
 enum class HostDirectLinkStatus {
     not_required,
     // Adapter/address ready; this status alone never proves a connected peer.
@@ -170,9 +175,10 @@ struct HostDirectLinkRestorationResult {
 };
 
 /**
- * Restores only the exact physical, unrouted Ethernet adapter recorded before
- * VisionForge changed it. Snapshot validation rejects WiFi, default-route and
- * adapter-identity mismatches.
+ * Restores only the exact physical Ethernet adapter recorded before VisionForge
+ * changed it. A fully restored DHCP profile may have its original default route;
+ * that case only removes the snapshot. Further mutation rejects routed targets,
+ * WiFi and adapter-identity mismatches.
  */
 [[nodiscard]] HostDirectLinkRestorationResult restore_host_direct_link_ipv4();
 [[nodiscard]] HostDirectLinkRestorationResult restore_host_direct_link_ipv4_automatically();
