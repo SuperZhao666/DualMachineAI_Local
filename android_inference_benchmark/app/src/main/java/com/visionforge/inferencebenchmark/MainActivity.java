@@ -583,6 +583,8 @@ public final class MainActivity extends Activity implements MobileAppActions {
             latestNoteElapsedMillis = monotonicMillis;
         }
         MobileRuntimeReportStore.Sample sample = MobileRuntimeReportStore.snapshot();
+        MobileTransportStatusCache.Sample transportSample = MobileTransportStatusCache.snapshot();
+        boolean transportReady = transportSample.readyAt(monotonicMillis);
         MobileRuntimeSnapshot snapshot = sample.snapshot;
         boolean sampleFresh = sample.sampledAtMillis > 0 && monotonicMillis >= sample.sampledAtMillis
                 && monotonicMillis - sample.sampledAtMillis <= MobileRuntimeSnapshot.LIVE_VIDEO_MAX_AGE_MILLIS;
@@ -623,7 +625,11 @@ public final class MainActivity extends Activity implements MobileAppActions {
                     "mobile_pipeline_metrics",
                     controlRuntime.inferenceAuditDetail() + " " + metricsEvent
                             + " report_generation=" + sample.generation
-                            + " report_age_ms=" + (monotonicMillis - sample.sampledAtMillis));
+                            + " report_age_ms=" + (monotonicMillis - sample.sampledAtMillis)
+                            + " transport_generation=" + transportSample.generation
+                            + " transport_age_ms=" + (transportSample.sampledAtMillis > 0
+                                    ? monotonicMillis - transportSample.sampledAtMillis : -1)
+                            + " transport_ready=" + transportReady);
         }
         MobileUiStateMapper.Input input = new MobileUiStateMapper.Input();
         input.receiverServiceReady = runtimeStatus.phase == MobileRuntimePhase.READY
@@ -633,7 +639,7 @@ public final class MainActivity extends Activity implements MobileAppActions {
         input.videoLinkLive = sampleFresh && snapshot.videoLinkLive;
         input.decoderReady = snapshot.decoderReady;
         input.qnnReady = snapshot.qnnReady;
-        input.makcuReady = snapshot.makcuReady;
+        input.makcuReady = transportReady;
         input.controlOutputEnabled = controlRuntime.isOutputEnabled();
         input.controlOutputRecoverySuspended =
                 controlRuntime.isOutputRecoverySuspended();

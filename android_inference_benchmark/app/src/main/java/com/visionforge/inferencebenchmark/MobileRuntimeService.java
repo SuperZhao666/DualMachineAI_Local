@@ -40,6 +40,9 @@ public final class MobileRuntimeService extends Service {
     private final MobileRuntimeReportStore.Cursor reportCursor = new MobileRuntimeReportStore.Cursor();
     private final java.util.concurrent.ExecutorService reportWorker = Executors.newSingleThreadExecutor();
     private final java.util.concurrent.atomic.AtomicBoolean reportPending = new java.util.concurrent.atomic.AtomicBoolean();
+    private final ScheduledExecutorService transportStatusWorker = Executors.newSingleThreadScheduledExecutor();
+    private java.util.concurrent.ScheduledFuture<?> transportStatusTask;
+    private long transportStatusGeneration;
     private final MobileTransportCatalog transportCatalog = new MobileTransportCatalog();
     private final LocalBinder binder = new LocalBinder();
     private final MobileRuntimeCompositionRoot composition = new MobileRuntimeCompositionRoot(binder);
@@ -127,6 +130,7 @@ public final class MobileRuntimeService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         events = new MobileEventLogger(this);
+        transportStatusGeneration = MobileTransportStatusCache.begin();
         submit(() -> {
             controlRuntime = MobileControlRuntime.get(this);
             responseCalibration = new MobileResponseCalibrationStore(this,events);
@@ -178,6 +182,23 @@ public final class MobileRuntimeService extends Service {
             publish(MobileRuntimePhase.READY,"本地模式：等待电脑连接");
         });
         healthTask=worker.scheduleWithFixedDelay(this::tickSafely,250,250,TimeUnit.MILLISECONDS);
+        // USB enumeration/handshake is independent of a Host, a usable route,
+        // model preparation and video reception. Never query it on the UI or
+        // place its status behind a potentially blocked QNN report call.
+        transportStatusTask=transportStatusWorker.scheduleWithFixedDelay(
+                this::sampleTransportStatus,0,250,TimeUnit.MILLISECONDS);
+    }
+
+    private void sampleTransportStatus() {
+        MobileControlRuntime runtime=controlRuntime;
+        if (destroying || runtime==null) return;
+        try {
+            long sampledAt=SystemClock.elapsedRealtime();
+            String report=runtime.makcuReport();
+            MobileTransportStatusCache.publish(transportStatusGeneration,sampledAt,report);
+        } catch (RuntimeException | LinkageError failure) {
+            events.write("output_transport_report_unavailable",MobileThrowableDiagnostics.format(failure));
+        }
     }
     @Override public int onStartCommand(Intent intent,int flags,int id) {
         if(intent!=null && ACTION_STOP.equals(intent.getAction())) {
@@ -490,6 +511,9 @@ public final class MobileRuntimeService extends Service {
             if(controlRuntime!=null) controlRuntime.failClosed("service_destroyed");
         });
         if(healthTask!=null) healthTask.cancel(false);
+        if(transportStatusTask!=null)transportStatusTask.cancel(false);
+        transportStatusWorker.shutdownNow();
+        MobileTransportStatusCache.end(transportStatusGeneration);
         reportWorker.shutdownNow();
         if(connectivity!=null) {
             if(networkCallback!=null) connectivity.unregisterNetworkCallback(networkCallback);

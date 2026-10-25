@@ -83,3 +83,13 @@ scripts/build-android.bat --offline
 ```
 
 原生使用CMake完整注册的测试；实际ARM像素入口为 `scripts/test-arm64-pixels.py --device <已配对设备> --output audit/<本次目录>`。设备回放、GUI重建、真实USB/蓝牙动作和用户实际对局分别记录，单位测试或fake sink不替代物理执行验收。
+
+## 实测后续：固定Host路径与1.5.16状态热修
+
+用户打开候选目录中的Host时，严格防火墙归属检查发现规则仍绑定 `dist/VFHost-Local.exe`，拒绝启动。根因是交付启动路径错误；未删除或重建规则，而将同一份1.1.5新Host回填固定路径，旧Host及旧APK备份保留，成对文件统一提交并明确标为测试候选。随后实际运行日志已确认固定路径进程启动和视频流进展。
+
+用户随后报告MAKCU未识别。Android当时枚举到1a86:55d3串口且App有USB权限；实际串口日志也确认open/adapter/protocol verified和命令回显。仍找到1.5.15新增的明确UI回归：UI改读pipeline缓存后，USB状态也被Host/模型/流水线ready条件阻塞。1.5.16通过独立Service-owned transport cache修复，250ms更新、代次/时间/过期保护；缓存仅供显示，不参与真实输出授权。新增回归覆盖无Host、模型失败、pipeline停止/重启、USB断开、旧Service及旧sample、过期/时钟倒退；完整Java现在52组通过。
+
+1.5.16 / code67的全部.so与已安装code66逐字节一致，包含原控制库SHA `7463c5220d7a56204dcd6b23b82693662f68552a5eaadc8f528e3e6f72e89b4f` 和原图。安装包已构建并签名验证；当前用户正常对局时保留code66，不重启活动会话。
+
+1.5.15六分钟隔离回放在用户准备开局时由助手明确结束，恢复VF前台；该次只有部分进展，不计完整长测通过。Instrumentation的Process crashed/run_id不匹配来自此次显式force-stop，不将其重新标为自然APP崩溃或新长测通过。

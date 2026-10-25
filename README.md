@@ -1,8 +1,14 @@
 # VisionForge 双机本地自用版
 
+**当前运行：手机 1.5.15-audit-fixes / code66，Host 1.1.5。另已构建 1.5.16-state-cache / code67 状态显示热修。** 新热修修正了Host未连接/模型未启动时MAKCU界面状态不刷新的回归，52组Java通过，全部原生库与code66逐字节一致。当前对局继续使用code66，code67包已准备，未在对局中重启安装。
+
+**Host固定启动路径：`dist/VFHost-Local.exe`。** 该路径已更新为1.1.5，并与现有防火墙规则绑定一致。`dist/candidates/`只作版本存档，直接运行其中EXE可能触发规则路径冲突；不要为此修改全局防火墙或代理。1.5.15成对默认文件已按测试候选身份更新，旧APK/EXE均已备份，`dist/CANDIDATE-STATUS.json`明确保留未通过的历史稳定性门禁。
+
+后文为1.5.15交付及更早历史。
+
 **审计修复测试版：Android 1.5.15-audit-fixes / code66，Host 1.1.5。** 已逐项核对两份 `ecb7c6e` 审计报告，并按用户明确选择保留唯一高置信陌生目标两帧/至少8ms快切。原始W8A16模型、640×640、身体框18%瞄点和校准作用域保留。
 
-本版已覆盖安装到手机，四份原校准文件安装前后SHA相同。新Host在 `dist/candidates/VFHost-Local-1.1.5-audit-fixes.exe`；当前运行的旧canonical Host未被强行替换。完整成对测试产物在 `dist/releases/1.5.15-audit-fixes/`，旧APK保留在 `dist/previous/`。
+本版已覆盖安装到手机，四份原校准文件安装前后SHA相同。新Host已回到固定路径 `dist/VFHost-Local.exe`，并已记录实际启动与传输日志。完整成对测试产物在 `dist/releases/1.5.15-audit-fixes/`，旧APK保留在 `dist/previous/`。
 
 **验收边界：** Android/Host构建与签名检查通过；51组Java、432个生产闭环组合及脚本故障注入通过。完整原生执行79项：77通过、1跳过（另在实际ARM跑过像素对照）、1项历史重遮挡性能目标失败。该目标在原提交也未通过；本版仍未达到其4次逻辑锁变化目标，不能声称全部稳定性门禁通过或实战抖动已经消失。正式默认成对发布门禁保持，当前产物标为审计修复测试版。
 

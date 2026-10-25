@@ -29,7 +29,7 @@
   },
   "runtime": "QNN HTP v75 W8A16 / U16 input / FP32 split outputs",
   "device": "Xiaomi 14 Pro SM8650",
-  "app_version": "1.5.15-audit-fixes",
+  "app_version": "1.5.16-state-cache",
   "capture_region": {
     "width": 640,
     "height": 640,
@@ -38,7 +38,7 @@
     "transport_height": 640
   },
   "head_location": "geometric estimate at box y=0.18; not trained head localization",
-  "status": "installed_audit_fixes_test_candidate_known_historical_gate_unmet",
+  "status": "state_cache_hotfix_built_code67_code66_running_during_gameplay",
   "archive_audit": "audit/model640-20261022/model-input-audit.json",
   "quantization": {
     "calibration": "audit/model640-20261022/corpus.json",
@@ -77,5 +77,7 @@
     "scope": "Historical 1.5.4 restore only. The 1.5.5 candidate rebuilds native code from source with control-selection diagnostics and short report locks; it does not reuse the baseline native binary."
   },
   "candidate_scope": "Two-report correctness fixes, explicit fast-stranger policy, original native640/body18%/calibration. Full native suite has one unmet historical severe-dropout performance target; measured tradeoffs remain and physical gameplay is not accepted.",
-  "current_deployment": "audit/report-fixes-20261025/delivery.json"
+  "current_deployment": "audit/report-fixes-20261025/delivery.json",
+  "current_installed_version": "1.5.15-audit-fixes",
+  "state_cache_hotfix_validation": "audit/report-fixes-20261025/state-cache-candidate.json"
 }

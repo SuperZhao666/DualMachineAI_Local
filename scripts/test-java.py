@@ -25,6 +25,7 @@ names.extend(['MoveDeliveryTraceSelfTest','DiagnosticTraceBatchSelfTest'])
 names.append('MobileRuntimeRecoverySelfTest')
 names.append('TransportLifecycleSelfTest')
 names.append('MobileCalibrationPersistencePolicySelfTest')
+names.append('MobileTransportStatusCacheSelfTest')
 runner=out/'LocalBehaviorTests.java'
 runner.write_text('''package com.visionforge.inferencebenchmark;
 public final class LocalBehaviorTests {

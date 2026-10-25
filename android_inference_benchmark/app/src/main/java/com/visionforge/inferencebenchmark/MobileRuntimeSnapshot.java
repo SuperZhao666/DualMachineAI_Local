@@ -92,10 +92,7 @@ final class MobileRuntimeSnapshot {
         } else {
             qnnRuntimeLabel = "QNN HTP";
         }
-        makcuReady = containsReady(makcuReport, "serial_open")
-                && containsReady(makcuReport, "adapter_identity_verified")
-                && containsReady(makcuReport, "protocol_identity_verified")
-                && !containsReady(makcuReport, "delivery_circuit_open");
+        makcuReady = makcuReadyFromReport(makcuReport);
         nativeControlOutputRequestedKnown = MobileDiagnosticFieldParser.hasField(
                 decoderReport, "output_requested");
         nativeControlOutputRequested = containsReady(decoderReport, "output_requested");
@@ -165,6 +162,13 @@ final class MobileRuntimeSnapshot {
 
     private static boolean containsReady(String report, String key) {
         return MobileDiagnosticFieldParser.isTrue(report, key);
+    }
+
+    static boolean makcuReadyFromReport(String report) {
+        String safe=safeReport(report);
+        return containsReady(safe,"serial_open") && containsReady(safe,"adapter_identity_verified")
+                && containsReady(safe,"protocol_identity_verified")
+                && !containsReady(safe,"delivery_circuit_open");
     }
 
     private static String value(String report, String field) {
