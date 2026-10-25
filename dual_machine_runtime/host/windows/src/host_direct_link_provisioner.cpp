@@ -9,6 +9,8 @@
 #include <shlobj.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <setupapi.h>
+#include <devguid.h>
 #include <netcon.h>
 #include <wrl/client.h>
 
@@ -76,11 +78,7 @@ enum class OriginalAddressMode {
     ics_private,
 };
 
-enum class AppliedAddressBackend {
-    none,
-    transient_ip_helper,
-    persistent_netsh,
-};
+using AppliedAddressBackend=HostDirectLinkAddressBackend;
 
 enum class RestoreAddressBackendHint {
     infer_from_live_state,
@@ -102,6 +100,7 @@ struct HostDirectLinkChangeSnapshot final {
     RestoreAddressBackendHint owned_address_backend{
         RestoreAddressBackendHint::infer_from_live_state};
     std::vector<std::string> static_ipv4_dns_servers;
+    std::vector<HostNetworkIpv4AddressProfile> preserved_ipv4;
     bool forwarding_enabled{};
     bool advertising_enabled{};
     std::uint32_t mtu{1500U};
@@ -318,7 +317,67 @@ std::wstring take_bstr(BSTR value) {
     return result;
 }
 
+std::map<std::string,HostNetworkDeviceIdentity> enumerate_network_device_identities() {
+    std::map<std::string,HostNetworkDeviceIdentity> result;
+    const auto devices=SetupDiGetClassDevsW(&GUID_DEVCLASS_NET,nullptr,nullptr,DIGCF_PRESENT);
+    if(devices==INVALID_HANDLE_VALUE)return result;
+    const auto property=[&](SP_DEVINFO_DATA& device,DWORD key) {
+        std::vector<std::wstring> values;DWORD type{},bytes{};
+        SetupDiGetDeviceRegistryPropertyW(devices,&device,key,&type,nullptr,0,&bytes);
+        if(!bytes || bytes>64U*1024U)return values;
+        std::vector<wchar_t> data((bytes+sizeof(wchar_t)-1U)/sizeof(wchar_t)+2U,L'\0');
+        if(!SetupDiGetDeviceRegistryPropertyW(devices,&device,key,&type,
+            reinterpret_cast<PBYTE>(data.data()),bytes,nullptr) || (type!=REG_SZ && type!=REG_MULTI_SZ))return values;
+        for(std::size_t offset{};offset<data.size() && data[offset];) {
+            const auto length=wcsnlen_s(data.data()+offset,data.size()-offset);
+            values.emplace_back(data.data()+offset,length);offset+=length+1U;
+            if(type==REG_SZ)break;
+        }
+        return values;
+    };
+    const auto registry_string=[](HKEY key,const wchar_t* name) {
+        DWORD type{},bytes{};
+        if(RegQueryValueExW(key,name,nullptr,&type,nullptr,&bytes)!=ERROR_SUCCESS ||
+           type!=REG_SZ || !bytes || bytes>64U*1024U)return std::wstring{};
+        std::vector<wchar_t> data((bytes+sizeof(wchar_t)-1U)/sizeof(wchar_t)+1U,L'\0');
+        if(RegQueryValueExW(key,name,nullptr,&type,reinterpret_cast<BYTE*>(data.data()),&bytes)!=ERROR_SUCCESS)return std::wstring{};
+        return std::wstring(data.data(),wcsnlen_s(data.data(),data.size()));
+    };
+    for(DWORD index{};;++index) {
+        SP_DEVINFO_DATA device{};device.cbSize=sizeof(device);
+        if(!SetupDiEnumDeviceInfo(devices,index,&device))break;
+        const auto key=SetupDiOpenDevRegKey(devices,&device,DICS_FLAG_GLOBAL,0,DIREG_DRV,KEY_READ);
+        if(key==INVALID_HANDLE_VALUE)continue;
+        const auto guid=normalize_identifier(narrow_ascii(registry_string(key,L"NetCfgInstanceId")));
+        HostNetworkDeviceIdentity identity;
+        identity.driver_inf=registry_string(key,L"InfPath");RegCloseKey(key);
+        if(guid.empty())continue;
+        identity.hardware_ids=property(device,SPDRP_HARDWAREID);
+        const auto service=property(device,SPDRP_SERVICE);
+        if(!service.empty())identity.service_name=service.front();
+        DWORD needed{};SetupDiGetDeviceInstanceIdW(devices,&device,nullptr,0,&needed);
+        if(needed && needed<32U*1024U) {
+            std::vector<wchar_t> instance(needed+1U,L'\0');
+            if(SetupDiGetDeviceInstanceIdW(devices,&device,instance.data(),static_cast<DWORD>(instance.size()),nullptr))identity.instance_id=instance.data();
+        }
+        identity.resolved=!identity.instance_id.empty() && !identity.hardware_ids.empty() && !identity.service_name.empty();
+        const auto [entry,inserted]=result.emplace(guid,std::move(identity));
+        if(!inserted)entry->second.resolved=false; // ambiguous GUID ownership is not authorization
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+    return result;
+}
+
+void apply_adapter_interface_identity(HostNetworkAdapterProfile& profile,const MIB_IF_ROW2* row,
+    ULONG if_type,const std::map<std::string,HostNetworkDeviceIdentity>& identities) {
+    profile.hardware_interface=row && row->InterfaceAndOperStatusFlags.HardwareInterface!=FALSE;
+    profile.transport=if_type==IF_TYPE_ETHERNET_CSMACD?HostAdapterTransport::ethernet:HostAdapterTransport::other;
+    profile.device_identity={};
+    if(const auto found=identities.find(normalize_identifier(profile.adapter_id));found!=identities.end())profile.device_identity=found->second;
+}
+
 std::vector<HostNetworkAdapterProfile> enumerate_network_profiles() {
+    const auto identities=enumerate_network_device_identities();
     std::vector<unsigned char> storage(16U * 1024U);
     ULONG size = static_cast<ULONG>(storage.size());
     constexpr ULONG address_flags =
@@ -345,8 +404,8 @@ std::vector<HostNetworkAdapterProfile> enumerate_network_profiles() {
         profile.interface_index = adapter->IfIndex;
         MIB_IF_ROW2 interface_row{};
         interface_row.InterfaceLuid = adapter->Luid;
-        profile.hardware_interface = GetIfEntry2(&interface_row) == NO_ERROR &&
-            interface_row.InterfaceAndOperStatusFlags.HardwareInterface != FALSE;
+        const bool interface_read=GetIfEntry2(&interface_row)==NO_ERROR;
+        apply_adapter_interface_identity(profile,interface_read?&interface_row:nullptr,adapter->IfType,identities);
         profile.operational = adapter->OperStatus == IfOperStatusUp;
         profile.has_default_gateway = has_ipv4_gateway(adapter->FirstGatewayAddress);
         profile.dhcp_enabled = (adapter->Flags & IP_ADAPTER_DHCP_ENABLED) != 0;
@@ -360,9 +419,6 @@ std::vector<HostNetworkAdapterProfile> enumerate_network_profiles() {
                 reinterpret_cast<const sockaddr_in*>(gateway->Address.lpSockaddr);
             const std::uint32_t ipv4 = ntohl(address->sin_addr.s_addr);
             if (ipv4 != 0U) profile.ipv4_gateways.push_back(format_ipv4(ipv4));
-        }
-        if (adapter->IfType == IF_TYPE_ETHERNET_CSMACD) {
-            profile.transport = HostAdapterTransport::ethernet;
         }
         for (auto* unicast = adapter->FirstUnicastAddress;
              unicast != nullptr; unicast = unicast->Next) {
@@ -1236,7 +1292,7 @@ std::string sha256_hex(std::string_view value) {
 
 std::string snapshot_payload(const HostDirectLinkChangeSnapshot& snapshot) {
     std::ostringstream output;
-    output << "version=2\n"
+    output << "version=3\n"
            << "adapter_id=" << snapshot.adapter_id << '\n'
            << "interface_index=" << snapshot.interface_index << '\n'
            << "address_mode="
@@ -1266,6 +1322,13 @@ std::string snapshot_payload(const HostDirectLinkChangeSnapshot& snapshot) {
            << "dns_count=" << snapshot.static_ipv4_dns_servers.size() << '\n';
     for (std::size_t index = 0; index < snapshot.static_ipv4_dns_servers.size(); ++index) {
         output << "dns_" << index << '=' << snapshot.static_ipv4_dns_servers[index] << '\n';
+    }
+    output << "preserved_ipv4_count=" << snapshot.preserved_ipv4.size() << '\n';
+    for(std::size_t i{};i<snapshot.preserved_ipv4.size();++i) {
+        const auto& a=snapshot.preserved_ipv4[i];
+        output << "preserved_ipv4_" << i << '=' << a.address << ';' << unsigned(a.prefix_length)
+            << ';' << a.prefix_origin << ';' << a.suffix_origin << ';'
+            << (a.skip_as_source.has_value()?unsigned(*a.skip_as_source):2U) << '\n';
     }
     return output.str();
 }
@@ -1364,41 +1427,10 @@ bool write_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail)
     return true;
 }
 
-bool load_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail) {
-    const std::filesystem::path path = direct_link_snapshot_path();
-    if (path.empty()) {
-        detail = "snapshot_local_app_data_unavailable";
-        return false;
+bool parse_snapshot_contents(std::string contents,HostDirectLinkChangeSnapshot& snapshot,std::string& detail) {
+    if(contents.empty() || contents.size()>kMaximumSnapshotBytes) {
+        detail="snapshot_size_invalid";return false;
     }
-    std::error_code size_error;
-    const std::uintmax_t snapshot_size = std::filesystem::file_size(path, size_error);
-    if (size_error) {
-        detail = "snapshot_size_read_failed win32=" +
-            std::to_string(size_error.value());
-        return false;
-    }
-    if (snapshot_size == 0U || snapshot_size > kMaximumSnapshotBytes) {
-        detail = "snapshot_size_invalid bytes=" + std::to_string(snapshot_size);
-        return false;
-    }
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        detail = "snapshot_open_failed";
-        return false;
-    }
-    std::string contents(static_cast<std::size_t>(kMaximumSnapshotBytes) + 1U, '\0');
-    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
-    const std::streamsize bytes_read = input.gcount();
-    if (input.bad()) {
-        detail = "snapshot_read_failed";
-        return false;
-    }
-    if (bytes_read <= 0 ||
-        bytes_read > static_cast<std::streamsize>(kMaximumSnapshotBytes)) {
-        detail = "snapshot_size_invalid bytes=" + std::to_string(bytes_read);
-        return false;
-    }
-    contents.resize(static_cast<std::size_t>(bytes_read));
     const std::string marker = "sha256=";
     const std::size_t marker_position = contents.rfind(marker);
     if (marker_position == std::string::npos ||
@@ -1446,7 +1478,7 @@ bool load_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail) 
     const std::string* dns_count = field("dns_count");
     std::uint32_t router_discovery_value{};
     std::uint32_t dns_server_count{};
-    if (version == nullptr || (*version != "1" && *version != "2") ||
+    if (version == nullptr || (*version != "1" && *version != "2" && *version != "3") ||
         adapter_id == nullptr ||
         !valid_adapter_id(*adapter_id) || interface_index == nullptr ||
         !parse_unsigned(*interface_index, snapshot.interface_index) ||
@@ -1469,7 +1501,7 @@ bool load_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail) 
         detail = "snapshot_contract_invalid";
         return false;
     }
-    if (*version == "2") {
+    if (*version != "1") {
         if (owned_address_backend == nullptr ||
             !parse_snapshot_backend(
                 *owned_address_backend, snapshot.owned_address_backend)) {
@@ -1500,13 +1532,73 @@ bool load_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail) 
         }
         snapshot.static_ipv4_dns_servers.push_back(*server);
     }
+    snapshot.preserved_ipv4.clear();
+    if(*version=="3") {
+        const auto count_text=field("preserved_ipv4_count");std::uint32_t count{};
+        if(!count_text || !parse_unsigned(*count_text,count) || count>64U) {
+            detail="snapshot_preserved_ipv4_count_invalid";return false;
+        }
+        for(std::uint32_t i{};i<count;++i) {
+            const auto value=field("preserved_ipv4_"+std::to_string(i));
+            if(!value){detail="snapshot_preserved_ipv4_missing";return false;}
+            auto row=*value;std::replace(row.begin(),row.end(),';',' ');
+            std::istringstream tokens(row);HostNetworkIpv4AddressProfile a;
+            unsigned prefix{},skip{};std::string extra;
+            if(!(tokens>>a.address>>prefix>>a.prefix_origin>>a.suffix_origin>>skip) ||
+                (tokens>>extra) || !valid_ipv4(a.address) || prefix>32U || skip>2U ||
+                a.prefix_origin!=IpPrefixOriginManual || a.address=="10.57.23.1") {
+                detail="snapshot_preserved_ipv4_invalid";return false;
+            }
+            a.prefix_length=static_cast<std::uint8_t>(prefix);
+            if(skip<2U)a.skip_as_source=skip!=0U;
+            snapshot.preserved_ipv4.push_back(std::move(a));
+        }
+    }
     const std::size_t expected_fields =
-        (*version == "2" ? 14U : 13U) + dns_server_count;
+        (*version == "1" ? 13U : *version=="2"?14U:15U) + dns_server_count+snapshot.preserved_ipv4.size();
     if (fields.size() != expected_fields) {
         detail = "snapshot_unknown_field";
         return false;
     }
     return true;
+}
+
+bool load_snapshot(HostDirectLinkChangeSnapshot& snapshot, std::string& detail) {
+    const std::filesystem::path path = direct_link_snapshot_path();
+    if (path.empty()) {
+        detail = "snapshot_local_app_data_unavailable";
+        return false;
+    }
+    std::error_code size_error;
+    const std::uintmax_t snapshot_size = std::filesystem::file_size(path, size_error);
+    if (size_error) {
+        detail = "snapshot_size_read_failed win32=" +
+            std::to_string(size_error.value());
+        return false;
+    }
+    if (snapshot_size == 0U || snapshot_size > kMaximumSnapshotBytes) {
+        detail = "snapshot_size_invalid bytes=" + std::to_string(snapshot_size);
+        return false;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        detail = "snapshot_open_failed";
+        return false;
+    }
+    std::string contents(static_cast<std::size_t>(kMaximumSnapshotBytes) + 1U, '\0');
+    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    const std::streamsize bytes_read = input.gcount();
+    if (input.bad()) {
+        detail = "snapshot_read_failed";
+        return false;
+    }
+    if (bytes_read <= 0 ||
+        bytes_read > static_cast<std::streamsize>(kMaximumSnapshotBytes)) {
+        detail = "snapshot_size_invalid bytes=" + std::to_string(bytes_read);
+        return false;
+    }
+    contents.resize(static_cast<std::size_t>(bytes_read));
+    return parse_snapshot_contents(std::move(contents),snapshot,detail);
 }
 
 bool read_static_ipv4_dns_servers(
@@ -1600,6 +1692,11 @@ bool capture_snapshot(const HostNetworkAdapterProfile& downstream,
     snapshot.interface_index = downstream.interface_index;
     snapshot.address_mode = downstream.has_ics_private_ipv4
         ? OriginalAddressMode::ics_private : OriginalAddressMode::dhcp;
+    snapshot.preserved_ipv4.clear();
+    for(const auto& address:downstream.ipv4_addresses)
+        if(address.prefix_origin==IpPrefixOriginManual && is_usable_address(address) && address.address!="10.57.23.1")
+            snapshot.preserved_ipv4.push_back(address);
+    if(snapshot.preserved_ipv4.size()>64U){detail="too_many_preserved_ipv4_addresses";return false;}
     if (!read_static_ipv4_dns_servers(
             downstream.adapter_id, snapshot.static_ipv4_dns_servers, detail)) {
         return false;
@@ -1626,8 +1723,10 @@ bool snapshot_can_use_transient_address_backend(
 RestoreAddressBackendHint choose_snapshot_owned_address_backend(
     const HostDirectLinkChangeSnapshot& snapshot,
     const HostNetworkAdapterProfile& downstream) noexcept {
-    if (!g_prefer_persistent_address_backend.load(std::memory_order_relaxed) &&
-        snapshot_can_use_transient_address_backend(snapshot, downstream)) {
+    const auto plan=plan_host_direct_link_address_backend(downstream,
+        snapshot.address_mode==OriginalAddressMode::dhcp,!snapshot.static_ipv4_dns_servers.empty(),
+        g_prefer_persistent_address_backend.load(std::memory_order_relaxed));
+    if (plan.backend==HostDirectLinkAddressBackend::transient_ip_helper) {
         return RestoreAddressBackendHint::transient_ip_helper;
     }
     return RestoreAddressBackendHint::persistent_netsh;
@@ -1680,7 +1779,8 @@ bool snapshot_dns_matches(const HostDirectLinkChangeSnapshot& snapshot) {
 bool snapshot_configuration_matches(const HostDirectLinkChangeSnapshot& snapshot) {
     const auto adapters = enumerate_network_profiles();
     const HostNetworkAdapterProfile* adapter = find_snapshot_adapter(snapshot, adapters);
-    if (adapter == nullptr || !host_direct_link_restored_address_matches(
+    if (adapter == nullptr || !host_direct_link_preserved_ipv4_matches(snapshot.preserved_ipv4,*adapter) ||
+        !host_direct_link_restored_address_matches(
             *adapter, snapshot.adapter_id,
             snapshot.address_mode == OriginalAddressMode::dhcp)) {
         return false;
@@ -1981,13 +2081,14 @@ bool is_base_direct_link_candidate(
     const HostNetworkAdapterProfile& adapter) noexcept {
     return adapter.hardware_interface && adapter.operational &&
         adapter.transport == HostAdapterTransport::ethernet &&
-        !adapter.has_default_gateway;
+        !adapter.has_default_gateway && !host_network_identity_is_software_loopback(adapter.device_identity);
 }
 
 bool is_operational_physical_ethernet(
     const HostNetworkAdapterProfile& adapter) noexcept {
     return adapter.hardware_interface && adapter.operational &&
-        adapter.transport == HostAdapterTransport::ethernet;
+        adapter.transport == HostAdapterTransport::ethernet &&
+        !host_network_identity_is_software_loopback(adapter.device_identity);
 }
 
 bool is_compatibility_transient_manual_address(
@@ -2064,6 +2165,7 @@ std::vector<std::string_view> rejection_predicates(
     if (adapter.has_default_gateway) {
         predicates.emplace_back("has_default_gateway");
     }
+    if(host_network_identity_is_software_loopback(adapter.device_identity))predicates.emplace_back("known_software_loopback");
     if (!is_base_direct_link_candidate(adapter)) {
         return predicates;
     }
@@ -2104,6 +2206,9 @@ std::string describe_adapter_inventory(
                << " guid=" << std::quoted(adapter.adapter_id)
                << " ifindex=" << adapter.interface_index
                << " hardware=" << bool_text(adapter.hardware_interface)
+               << " device_identity_resolved=" << bool_text(host_network_identity_is_resolved(adapter.device_identity))
+               << " known_software_loopback=" << bool_text(host_network_identity_is_software_loopback(adapter.device_identity))
+               << " automatic_mutation_allowed=" << bool_text(host_direct_link_adapter_mutation_is_admissible(adapter))
                << " oper=" << (adapter.operational ? "up" : "down")
                << " transport=" << transport_name(adapter.transport)
                << " has_default_gateway="
@@ -2175,6 +2280,26 @@ std::string describe_ambiguous_adapters(
 
 }  // namespace
 
+bool host_network_identity_is_software_loopback(const HostNetworkDeviceIdentity& identity) noexcept {
+    const auto equal=[](std::wstring_view a,std::wstring_view b) {
+        return a.size()==b.size() && std::equal(a.begin(),a.end(),b.begin(),[](wchar_t x,wchar_t y){return std::towlower(x)==std::towlower(y);});
+    };
+    for(const auto& id:identity.hardware_ids)if(equal(id,L"*msloop"))return true;
+    if(equal(identity.service_name,L"kmloop"))return true;
+    const auto slash=identity.driver_inf.find_last_of(L"\\/");
+    const auto leaf=std::wstring_view(identity.driver_inf).substr(slash==std::wstring::npos?0U:slash+1U);
+    return equal(leaf,L"netloop.inf");
+}
+
+bool host_network_identity_is_resolved(const HostNetworkDeviceIdentity& identity) noexcept {
+    return identity.resolved && !identity.instance_id.empty() &&
+        !identity.hardware_ids.empty() && !identity.service_name.empty();
+}
+
+bool host_direct_link_adapter_mutation_is_admissible(const HostNetworkAdapterProfile& adapter) noexcept {
+    return is_base_direct_link_candidate(adapter) && host_network_identity_is_resolved(adapter.device_identity);
+}
+
 bool host_direct_link_has_any_isolated_address(
     const HostNetworkAdapterProfile& adapter) noexcept {
     if (adapter.has_isolated_private_ipv4) return true;
@@ -2190,6 +2315,7 @@ bool host_direct_link_restored_address_matches(
     bool originally_dhcp) noexcept {
     if (adapter.adapter_id != snapshot_adapter_id || !adapter.hardware_interface ||
         adapter.transport != HostAdapterTransport::ethernet ||
+        host_network_identity_is_software_loopback(adapter.device_identity) ||
         host_direct_link_has_any_isolated_address(adapter)) return false;
     if (originally_dhcp) return adapter.dhcp_enabled;
     return !adapter.has_default_gateway && adapter.has_ics_private_ipv4;
@@ -2244,6 +2370,94 @@ HostDirectLinkPlan choose_host_direct_link_plan(
     plan.downstream_adapter = configurable_adapters.front();
     plan.reason = "isolated_wired_adapter_selected";
     return plan;
+}
+
+bool host_direct_link_preserved_ipv4_matches(
+    const std::vector<HostNetworkIpv4AddressProfile>& expected,const HostNetworkAdapterProfile& current) noexcept {
+    return std::all_of(expected.begin(),expected.end(),[&](const auto& before) {
+        return std::any_of(current.ipv4_addresses.begin(),current.ipv4_addresses.end(),[&](const auto& after) {
+            return before.address==after.address && before.prefix_length==after.prefix_length &&
+                before.prefix_origin==after.prefix_origin && before.suffix_origin==after.suffix_origin &&
+                before.skip_as_source==after.skip_as_source && is_usable_address(after);
+        });
+    });
+}
+
+HostDirectLinkAddressPlan plan_host_direct_link_address_backend(
+    const HostNetworkAdapterProfile& downstream,bool originally_dhcp,
+    bool has_static_dns,bool prefer_persistent) {
+    HostDirectLinkAddressPlan plan{};
+    if(host_network_identity_is_software_loopback(downstream.device_identity)) {
+        plan.reason="software_loopback_not_direct_link";return plan;
+    }
+    if(!is_base_direct_link_candidate(downstream) || has_owned_subnet_address_conflict(downstream)) {
+        plan.reason="unsafe_direct_link_address_target";return plan;
+    }
+    if(!host_network_identity_is_resolved(downstream.device_identity)) {
+        plan.reason="direct_link_device_identity_unresolved_no_automatic_mutation";return plan;
+    }
+    const bool existing=has_preexisting_static_usable_ipv4(downstream);
+    const bool transient=originally_dhcp && downstream.dhcp_enabled && !has_static_dns;
+    plan.preserve_existing_ipv4=existing;
+    if(existing) {
+        if(!transient || !has_only_compatibility_transient_manual_addresses(downstream)) {
+            plan.reason="preexisting_static_ipv4_requires_non_destructive_alias";return plan;
+        }
+        plan.backend=HostDirectLinkAddressBackend::transient_ip_helper;
+        plan.reason="protected_existing_ipv4_alias_only";
+        return plan;
+    }
+    plan.backend=transient && !prefer_persistent
+        ?HostDirectLinkAddressBackend::transient_ip_helper:HostDirectLinkAddressBackend::persistent_netsh;
+    plan.allow_persistent_fallback=plan.backend==HostDirectLinkAddressBackend::transient_ip_helper;
+    plan.reason=prefer_persistent?"persistent_preference":"ordinary_address_backend";
+    return plan;
+}
+
+HostDirectLinkAddressExecution execute_host_direct_link_address_plan(
+    const HostDirectLinkAddressPlan& plan,const HostDirectLinkAddressOperations& operations) {
+    HostDirectLinkAddressExecution result{};
+    if(plan.backend==HostDirectLinkAddressBackend::none || !operations.record_backend ||
+       !operations.prepare_private_sharing || !operations.create_transient ||
+       !operations.configure_persistent || !operations.configure_dns ||
+       !operations.configure_interface_policy || !operations.verify || !operations.rollback ||
+       (plan.preserve_existing_ipv4 && (plan.backend!=HostDirectLinkAddressBackend::transient_ip_helper || plan.allow_persistent_fallback))) {
+        result.transaction.detail="address_plan_rejected_before_mutation "+plan.reason;return result;
+    }
+    result.transaction=execute_host_direct_link_transaction({
+        .apply=[&](HostDirectLinkMutationStep step,std::string& detail) {
+            switch(step) {
+                case HostDirectLinkMutationStep::address: {
+                    if(!operations.record_backend(plan.backend,detail))return false;
+                    if(!plan.preserve_existing_ipv4 && !operations.prepare_private_sharing(detail))return false;
+                    if(plan.backend==HostDirectLinkAddressBackend::transient_ip_helper) {
+                        const auto status=operations.create_transient(detail);
+                        if(status==HostDirectLinkTransientStatus::created) {
+                            result.applied_backend=HostDirectLinkAddressBackend::transient_ip_helper;return true;
+                        }
+                        if(status==HostDirectLinkTransientStatus::ownership_conflict ||
+                           status==HostDirectLinkTransientStatus::validation_failed ||
+                           !plan.allow_persistent_fallback) {
+                            if(plan.preserve_existing_ipv4)detail="non_destructive_alias_required_no_netsh_fallback "+detail;
+                            return false;
+                        }
+                    }
+                    if(!operations.record_backend(HostDirectLinkAddressBackend::persistent_netsh,detail))return false;
+                    // Record before invoking an operation which can partially apply.
+                    result.applied_backend=HostDirectLinkAddressBackend::persistent_netsh;
+                    return operations.configure_persistent(detail);
+                }
+                case HostDirectLinkMutationStep::dns:
+                    return result.applied_backend==HostDirectLinkAddressBackend::transient_ip_helper || operations.configure_dns(detail);
+                case HostDirectLinkMutationStep::interface_policy:return operations.configure_interface_policy(detail);
+                case HostDirectLinkMutationStep::verify:return false;
+            }
+            return false;
+        },
+        .verify=operations.verify,
+        .rollback=[&](std::string& detail) {return operations.rollback(result.applied_backend,detail);},
+    });
+    return result;
 }
 
 HostDirectLinkTransactionResult execute_host_direct_link_transaction(
@@ -2329,6 +2543,11 @@ HostDirectLinkProvisioningResult ensure_host_direct_link_ipv4() {
         }
         return outcome;
     }
+    if(!host_direct_link_adapter_mutation_is_admissible(downstream)) {
+        outcome.status=HostDirectLinkStatus::unavailable;
+        outcome.detail="direct_link_device_identity_unresolved_no_automatic_mutation";
+        return outcome;
+    }
     if (!process_is_elevated()) {
         outcome.status = HostDirectLinkStatus::requires_elevation;
         outcome.detail = "isolated_wired_configuration_requires_elevation";
@@ -2376,6 +2595,13 @@ HostDirectLinkProvisioningResult ensure_host_direct_link_ipv4() {
             outcome.detail = snapshot_error;
             return outcome;
         }
+        const auto initial_plan=plan_host_direct_link_address_backend(downstream,
+            snapshot.address_mode==OriginalAddressMode::dhcp,!snapshot.static_ipv4_dns_servers.empty(),
+            g_prefer_persistent_address_backend.load(std::memory_order_relaxed));
+        if(initial_plan.backend==HostDirectLinkAddressBackend::none) {
+            outcome.status=HostDirectLinkStatus::unavailable;
+            outcome.detail=initial_plan.reason;return outcome;
+        }
         snapshot.owned_address_backend =
             choose_snapshot_owned_address_backend(snapshot, downstream);
         if (!write_snapshot(snapshot, snapshot_error)) {
@@ -2386,138 +2612,75 @@ HostDirectLinkProvisioningResult ensure_host_direct_link_ipv4() {
     }
     outcome.snapshot_sha256 = snapshot.sha256;
 
-    const bool transient_address_candidate =
-        snapshot_can_use_transient_address_backend(snapshot, downstream);
-    const bool prefer_persistent_backend =
-        g_prefer_persistent_address_backend.load(std::memory_order_relaxed);
-    const bool coexisting_preexisting_ipv4 =
-        has_preexisting_static_usable_ipv4(downstream);
-    if (coexisting_preexisting_ipv4 &&
-        !transient_address_candidate) {
-        outcome.status = HostDirectLinkStatus::unavailable;
-        outcome.detail =
-            "preexisting_static_ipv4_requires_non_destructive_alias_but_static_dns_is_present";
-        return outcome;
+    const auto address_plan=plan_host_direct_link_address_backend(downstream,
+        snapshot.address_mode==OriginalAddressMode::dhcp,!snapshot.static_ipv4_dns_servers.empty(),
+        g_prefer_persistent_address_backend.load(std::memory_order_relaxed));
+    if(address_plan.backend==HostDirectLinkAddressBackend::none) {
+        outcome.status=HostDirectLinkStatus::unavailable;outcome.detail=address_plan.reason;return outcome;
     }
-    AppliedAddressBackend applied_address_backend = AppliedAddressBackend::none;
-    const HostDirectLinkTransactionResult transaction =
-        execute_host_direct_link_transaction({
-            .apply = [&](HostDirectLinkMutationStep step, std::string& detail) {
-                switch (step) {
-                    case HostDirectLinkMutationStep::address: {
-                        if (!disable_selected_private_sharing(downstream, detail)) return false;
-                        if (transient_address_candidate && !prefer_persistent_backend) {
-                            std::string native_detail;
-                            const TransientAddressCreateStatus native_status =
-                                create_transient_isolated_address(
-                                    downstream.interface_index, native_detail);
-                            if (native_status == TransientAddressCreateStatus::created) {
-                                applied_address_backend =
-                                    AppliedAddressBackend::transient_ip_helper;
-                                detail.clear();
-                                return true;
-                            }
-                            if (native_status ==
-                                    TransientAddressCreateStatus::ownership_conflict ||
-                                native_status ==
-                                    TransientAddressCreateStatus::validation_failed) {
-                                detail = native_detail;
-                                return false;
-                            }
-                            if (coexisting_preexisting_ipv4) {
-                                detail =
-                                    "non_destructive_alias_required_no_netsh_fallback " +
-                                    native_detail;
-                                return false;
-                            }
-                            std::string netsh_detail;
-                            // netsh can change DHCP/static state before it
-                            // returns an error or times out.  Record ownership
-                            // before starting it so rollback always restores
-                            // the persistent address mode after partial apply.
-                            if (!persist_snapshot_owned_address_backend(
-                                    snapshot,
-                                    RestoreAddressBackendHint::persistent_netsh,
-                                    netsh_detail)) {
-                                detail = "snapshot_backend_update_failed " +
-                                    netsh_detail;
-                                return false;
-                            }
-                            applied_address_backend =
-                                AppliedAddressBackend::persistent_netsh;
-                            if (run_netsh_for_adapter(
-                                    downstream, L"interface ipv4 set address name=",
-                                    L" source=static address=10.57.23.1 mask=255.255.255.0"
-                                     L" gateway=none store=persistent",
-                                    netsh_detail)) {
-                                if (!mark_isolated_address_skip_as_source(
-                                        downstream.interface_index, netsh_detail)) {
-                                    detail = "netsh_address_configured " + netsh_detail;
-                                    return false;
-                                }
-                                detail.clear();
-                                return true;
-                            }
-                            detail = "ip_helper_attempt={" + native_detail +
-                                "} netsh_fallback={" + netsh_detail + "}";
-                            return false;
-                        }
-                        std::string snapshot_backend_detail;
-                        if (!persist_snapshot_owned_address_backend(
-                                snapshot,
-                                RestoreAddressBackendHint::persistent_netsh,
-                                snapshot_backend_detail)) {
-                            detail = "snapshot_backend_update_failed " +
-                                snapshot_backend_detail;
-                            return false;
-                        }
-                        applied_address_backend =
-                            AppliedAddressBackend::persistent_netsh;
-                        const bool configured = run_netsh_for_adapter(
-                            downstream, L"interface ipv4 set address name=",
-                            L" source=static address=10.57.23.1 mask=255.255.255.0"
-                             L" gateway=none store=persistent",
-                            detail);
-                        if (configured && !mark_isolated_address_skip_as_source(
-                                downstream.interface_index, detail)) {
-                            return false;
-                        }
-                        return configured;
-                    }
-                    case HostDirectLinkMutationStep::dns:
-                        if (applied_address_backend ==
-                            AppliedAddressBackend::transient_ip_helper) {
-                            detail.clear();
-                            return true;
-                        }
-                        return run_netsh_for_adapter(
-                            downstream, L"interface ipv4 set dnsservers name=",
-                            L" source=static address=none register=none validate=no",
-                            detail);
-                    case HostDirectLinkMutationStep::interface_policy:
-                        return apply_isolated_interface_policy_with_fallback(
-                            downstream, detail);
-                    case HostDirectLinkMutationStep::verify:
-                        detail = "verify_is_not_an_apply_step";
-                        return false;
-                }
-                return false;
-            },
-            .verify = [&](std::string& detail) {
-                return wait_for_isolated_address_preferred(
-                    downstream.interface_index, detail);
-            },
-            .rollback = [&](std::string& detail) {
-                const RestoreAddressBackendHint hint =
-                    applied_address_backend == AppliedAddressBackend::transient_ip_helper
-                    ? RestoreAddressBackendHint::transient_ip_helper
-                    : (applied_address_backend == AppliedAddressBackend::persistent_netsh
-                        ? RestoreAddressBackendHint::persistent_netsh
-                        : RestoreAddressBackendHint::infer_from_live_state);
-                return restore_snapshot_configuration(
-                    snapshot, downstream, hint, detail);
-            },
-        });
+    if(address_plan.preserve_existing_ipv4 && snapshot.preserved_ipv4.empty()) {
+        // Upgrade an older snapshot's guard from the still-present protected
+        // aliases before any new mutation. This does not recreate lost aliases.
+        for(const auto& a:downstream.ipv4_addresses)
+            if(a.prefix_origin==IpPrefixOriginManual && is_usable_address(a) && a.address!="10.57.23.1")snapshot.preserved_ipv4.push_back(a);
+        if(snapshot.preserved_ipv4.size()>64U || !write_snapshot(snapshot,snapshot_error)) {
+            outcome.status=HostDirectLinkStatus::failed;outcome.detail="snapshot_preserved_ipv4_upgrade_failed "+snapshot_error;return outcome;
+        }
+    }
+    const bool prefer_persistent_backend=g_prefer_persistent_address_backend.load(std::memory_order_relaxed);
+    const auto execution=execute_host_direct_link_address_plan(address_plan,{
+        .record_backend=[&](HostDirectLinkAddressBackend backend,std::string& detail) {
+            return persist_snapshot_owned_address_backend(snapshot,
+                backend==HostDirectLinkAddressBackend::transient_ip_helper
+                    ?RestoreAddressBackendHint::transient_ip_helper:RestoreAddressBackendHint::persistent_netsh,detail);
+        },
+        .prepare_private_sharing=[&](std::string& detail) {return disable_selected_private_sharing(downstream,detail);},
+        .create_transient=[&](std::string& detail) {
+            const auto status=create_transient_isolated_address(downstream.interface_index,detail);
+            switch(status) {
+                case TransientAddressCreateStatus::created:return HostDirectLinkTransientStatus::created;
+                case TransientAddressCreateStatus::ownership_conflict:return HostDirectLinkTransientStatus::ownership_conflict;
+                case TransientAddressCreateStatus::validation_failed:return HostDirectLinkTransientStatus::validation_failed;
+                default:return HostDirectLinkTransientStatus::failed;
+            }
+        },
+        .configure_persistent=[&](std::string& detail) {
+            return run_netsh_for_adapter(downstream,L"interface ipv4 set address name=",
+                L" source=static address=10.57.23.1 mask=255.255.255.0 gateway=none store=persistent",detail) &&
+                mark_isolated_address_skip_as_source(downstream.interface_index,detail);
+        },
+        .configure_dns=[&](std::string& detail) {
+            return run_netsh_for_adapter(downstream,L"interface ipv4 set dnsservers name=",
+                L" source=static address=none register=none validate=no",detail);
+        },
+        .configure_interface_policy=[&](std::string& detail) {return apply_isolated_interface_policy_with_fallback(downstream,detail);},
+        .verify=[&](std::string& detail) {
+            if(!wait_for_isolated_address_preferred(downstream.interface_index,detail))return false;
+            const auto profiles=enumerate_network_profiles();
+            const auto current=find_snapshot_adapter(snapshot,profiles);
+            if(!current || !host_direct_link_preserved_ipv4_matches(snapshot.preserved_ipv4,*current)) {
+                detail="preserved_ipv4_state_changed";return false;
+            }
+            return true;
+        },
+        .rollback=[&](HostDirectLinkAddressBackend applied,std::string& detail) {
+            if(address_plan.preserve_existing_ipv4 && applied==HostDirectLinkAddressBackend::none) {
+                // Failed/unowned alias creation must not delete another actor's
+                // address or restore an address mode we never changed.
+                const bool unchanged=snapshot_configuration_matches(snapshot);
+                if(!unchanged)detail="protected_alias_creation_failed_state_requires_review";
+                return unchanged;
+            }
+            const auto hint=applied==HostDirectLinkAddressBackend::transient_ip_helper
+                ?RestoreAddressBackendHint::transient_ip_helper:
+                applied==HostDirectLinkAddressBackend::persistent_netsh
+                    ?RestoreAddressBackendHint::persistent_netsh:RestoreAddressBackendHint::infer_from_live_state;
+            return restore_snapshot_configuration(snapshot,downstream,hint,detail);
+        },
+    });
+    const auto& transaction=execution.transaction;
+    const auto applied_address_backend=execution.applied_backend;
+    outcome.snapshot_sha256=snapshot.sha256;
     if (!transaction.succeeded) {
         outcome.status = HostDirectLinkStatus::failed;
         outcome.detail = transaction.detail;
@@ -2538,7 +2701,7 @@ HostDirectLinkProvisioningResult ensure_host_direct_link_ipv4() {
         " dhcp_explicit_source_required=1 isolated_subnet_state={" +
         describe_host_isolated_subnet_state() +
         "} coexisting_preexisting_ipv4=" +
-        (coexisting_preexisting_ipv4 ? "1" : "0") +
+        (address_plan.preserve_existing_ipv4 ? "1" : "0") +
         " interface_policy=ip_helper_or_diagnostic_fallback restore_snapshot=pending";
     return outcome;
 }
@@ -2601,9 +2764,11 @@ HostDirectLinkRestorationResult restore_host_direct_link_ipv4() {
     const auto adapters = enumerate_network_profiles();
     const HostNetworkAdapterProfile* downstream = find_snapshot_adapter(snapshot, adapters);
     if (downstream == nullptr || !downstream->hardware_interface ||
-        downstream->transport != HostAdapterTransport::ethernet) {
+        downstream->transport != HostAdapterTransport::ethernet ||
+        host_network_identity_is_software_loopback(downstream->device_identity) ||
+        !host_network_identity_is_resolved(downstream->device_identity)) {
         outcome.status = HostDirectLinkRestoreStatus::unsafe_snapshot;
-        outcome.detail = "snapshot_adapter_identity_or_route_mismatch";
+        outcome.detail = "snapshot_adapter_identity_unresolved_or_software_loopback_record_retained";
         return outcome;
     }
     outcome.downstream_name = downstream->connection_name;

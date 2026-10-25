@@ -36,6 +36,40 @@ final class ControlOutputCoordinatorSelfTest {
         verifiesReconnectFailuresUseBoundedBackoff();
         verifiesStaleLifecycleCannotReopenOutput();
         verifiesCachedReportCannotUndoItsSynchronousEnable();
+        verifiesUnconsumedReportCannotUndoIndependentButtonEnable();
+    }
+
+    private static void verifiesUnconsumedReportCannotUndoIndependentButtonEnable() {
+        FakeMakcu makcu=new FakeMakcu(true);List<String> calls=new ArrayList<>();
+        FakeProfile profile=new FakeProfile(true,calls);profile.trigger=ControlTrigger.SIDE_BUTTON_1;
+        ControlOutputCoordinator coordinator=new ControlOutputCoordinator(makcu,profile,new FakeEvents());
+        coordinator.reconcileAutomaticState(true,true,false,false,false);
+        makcu.completeButtonStreamConfiguration();
+        long sampled=coordinator.authorizationRevision(); // Native report read false before the button notification.
+        makcu.publishButtonMask(8);require(coordinator.isOutputEnabled());
+        calls.clear();
+        require(!coordinator.reconcileAtRevision(sampled,true,true,false,false,false));
+        require(coordinator.isOutputEnabled() && !calls.contains("profile:false"));
+        long current=coordinator.authorizationRevision();
+        require(coordinator.reconcileAtRevision(current,true,true,false,false,false));
+        require(!coordinator.isOutputEnabled()); // Real native withdrawal sampled in the current revision still closes.
+        makcu.publishButtonMask(0);makcu.publishButtonMask(8);require(coordinator.isOutputEnabled());
+        long enabled=coordinator.authorizationRevision();makcu.publishButtonMask(0);
+        require(!coordinator.isOutputEnabled());
+        require(!coordinator.reconcileAtRevision(enabled,true,true,true,true,false));
+        require(!coordinator.isOutputEnabled());
+        long oldRoute=coordinator.authorizationRevision();coordinator.dispose();
+        ControlOutputCoordinator replacement=new ControlOutputCoordinator(new FakeMakcu(true),new FakeProfile(true),new FakeEvents());
+        require(!replacement.reconcileAtRevision(oldRoute,true,true,true,true,false));
+        require(!replacement.isOutputEnabled());
+        long alreadyClosed=replacement.authorizationRevision();
+        replacement.failClosed("explicit_user_revocation");
+        require(!replacement.reconcileAtRevision(alreadyClosed,true,true,false,false,false));
+        long awaitingHealth=replacement.authorizationRevision();
+        replacement.failClosedForMissingHealth("waiting_for_first_report");
+        require(replacement.authorizationRevision()==awaitingHealth);
+        require(replacement.reconcileAtRevision(awaitingHealth,true,true,false,false,false));
+        require(replacement.isOutputEnabled());
     }
 
     private static void verifiesCachedReportCannotUndoItsSynchronousEnable() {

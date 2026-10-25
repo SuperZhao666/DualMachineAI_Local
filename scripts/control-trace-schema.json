@@ -614,7 +614,8 @@
         62,
         65,
         66,
-        67
+        67,
+        68
       ],
       "meanings": {
         "16384": "valid_large_background_motion_recovered",
@@ -627,12 +628,14 @@
         "50..55 and57..58 use the reviewed49..61 release-range contract, not an independently verified binary for every code; unsupported future versions remain unknown",
         "audit/iteration-161-20261024/baseline.json verifies code62 keeps the same Core/Servo/Pending producer; only pre-inference freshness handoff changes",
         "Source audit ecb7c6e/code65 and report fixes code66: MobileControlCore emits16384 only for background_valid_this_frame_ && frame.background.large_motion_recovered;32768 is unassigned. Codes63/64 remain unsupported without retained-source verification.",
-        "Code67 is a Java-only transport status cache hotfix using the byte-identical code66 native library 7463c5220d7a56204dcd6b23b82693662f68552a5eaadc8f528e3e6f72e89b4f; flag producer/layout unchanged."
+        "Code67 is a Java-only transport status cache hotfix using the byte-identical code66 native library 7463c5220d7a56204dcd6b23b82693662f68552a5eaadc8f528e3e6f72e89b4f; flag producer/layout unchanged.",
+        "Code68/round3 retains the control flag producer high bits; new velocity_flags history-state nibbles are documented separately and do not change control flags16384/32768."
       ],
       "version_codes": [
         65,
         66,
-        67
+        67,
+        68
       ]
     }
   },
@@ -651,5 +654,22 @@
     "5": "restored_scale_disagreement",
     "6": "ambiguous_delay",
     "7": "identified"
+  },
+  "velocity_history_state_encoding": {
+    "first_version_code": 68,
+    "target_shift": 8,
+    "disturbance_shift": 12,
+    "mask": 15,
+    "states": {
+      "0": "insufficient",
+      "1": "stationary",
+      "2": "moving",
+      "3": "uncertain",
+      "4": "invalid_input",
+      "5": "non_contiguous",
+      "6": "unsupported_interval",
+      "7": "invalid_background",
+      "8": "stale_observation"
+    }
   }
 }

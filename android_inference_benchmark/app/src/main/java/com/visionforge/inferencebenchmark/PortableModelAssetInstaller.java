@@ -113,7 +113,7 @@ final class PortableModelAssetInstaller {
             AssetSource source) throws IOException {
         MessageDigest digest = sha256();
         long copied = 0L;
-        try (InputStream input = source.open(descriptor.assetName);
+        try (InputStream input = MobilePackagedAssetException.open(descriptor.assetName,()->source.open(descriptor.assetName));
              FileOutputStream output = new FileOutputStream(temporary)) {
             byte[] buffer = new byte[COPY_BUFFER_BYTES];
             int read;

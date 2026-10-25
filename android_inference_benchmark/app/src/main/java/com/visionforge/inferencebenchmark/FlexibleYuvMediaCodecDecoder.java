@@ -76,6 +76,9 @@ final class FlexibleYuvMediaCodecDecoder {
 
     /** Mutable counters owned by exactly one published codec generation. */
     private static final class DecoderOutputState {
+        final DecoderCallbackToken callbackToken;
+        DecoderOutputState() {callbackToken=null;}
+        DecoderOutputState(DecoderCallbackToken token) {callbackToken=token;}
         final DecoderOutputProgressTracker progress =
                 new DecoderOutputProgressTracker();
         int consecutiveFailures;
@@ -87,7 +90,7 @@ final class FlexibleYuvMediaCodecDecoder {
             resetInputMetrics();
             long generation = lifecycleGeneration.incrementAndGet();
             detachAndReleaseActiveCodec("start_replacement");
-            return startReplacement(width, height, generation);
+            return startReplacement(width, height, generation,0);
         }
     }
 
@@ -104,7 +107,7 @@ final class FlexibleYuvMediaCodecDecoder {
             boolean restarted = false;
             String diagnostic = "replacement_start_failed";
             try {
-                restarted = startReplacement(width, height, lifecycleToken);
+                restarted = startReplacement(width, height, lifecycleToken,nativeGeneration);
                 diagnostic = restarted ? "none" : "replacement_cancelled_or_failed";
             } catch (RuntimeException failure) {
                 diagnostic = failure.getClass().getSimpleName() + ":replacement";
@@ -124,12 +127,13 @@ final class FlexibleYuvMediaCodecDecoder {
         return true;
     }
 
-    private boolean startReplacement(int width, int height, long generation) {
+    private boolean startReplacement(int width, int height, long generation,long expectedNativeStream) {
         if (width <= 0 || height <= 0) {
             return false;
         }
         MediaCodec created = null;
         try {
+            final DecoderCallbackToken callbackToken=DecoderCallbackToken.create(QnnHtpBridge.getNativeH264CallbackContext(),generation,expectedNativeStream);
             created = createDecoder();
             MediaFormat format = MediaFormat.createVideoFormat(
                     MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
@@ -156,7 +160,10 @@ final class FlexibleYuvMediaCodecDecoder {
                     new DecoderAccessUnitQueue(
                             MAX_INPUT_AGE_NANOS, MAX_QUEUED_COMPRESSED_BYTES);
             final DecoderOutputState activeOutputState =
-                    new DecoderOutputState();
+                    new DecoderOutputState(callbackToken);
+            if(!QnnHtpBridge.publishNativeH264Codec(callbackToken.binding,callbackToken.stream,callbackToken.codec)) {
+                releaseCodecAfterWorkersExitAsync(activeCodec,null,null,"native_codec_owner_rejected");return false;
+            }
             synchronized (lifecycleLock) {
                 if (lifecycleGeneration.get() != generation) {
                     releaseCodecAfterWorkersExitAsync(
@@ -177,7 +184,7 @@ final class FlexibleYuvMediaCodecDecoder {
                 inputThread = new Thread(
                         () -> drainInput(
                                 activeCodec, activeInputQueue,
-                                activeOutputState.progress),
+                                activeOutputState.progress,callbackToken),
                         "vf-flexible-yuv-decoder-input");
                 outputThread = new Thread(
                         () -> drainOutput(
@@ -187,10 +194,10 @@ final class FlexibleYuvMediaCodecDecoder {
                 inputThread.start();
                 outputThread.start();
             }
-            QnnHtpBridge.updateNativeH264JavaDecoderFormat(
+            QnnHtpBridge.updateNativeH264JavaDecoderFormatAtGeneration(
                     activeDescription, COLOR_FORMAT_YUV420_FLEXIBLE,
                     MediaFormat.COLOR_STANDARD_BT709, MediaFormat.COLOR_RANGE_LIMITED,
-                    width, height);
+                    width, height,callbackToken.binding,callbackToken.stream,callbackToken.codec);
             Log.i(TAG, "decoder_started codec=" + activeDescription
                     + " requested=YUV_420_888 size=" + width + "x" + height
                     + " priority=" + REALTIME_CODEC_PRIORITY
@@ -325,7 +332,7 @@ final class FlexibleYuvMediaCodecDecoder {
     private void drainInput(
             MediaCodec activeCodec,
             DecoderAccessUnitQueue activeInputQueue,
-            DecoderOutputProgressTracker activeOutputProgress) {
+            DecoderOutputProgressTracker activeOutputProgress,DecoderCallbackToken callbackToken) {
         promotePipelineThread("input");
         try {
             while (running.get() && isActive(activeCodec) && !activeInputQueue.isClosed()) {
@@ -334,7 +341,7 @@ final class FlexibleYuvMediaCodecDecoder {
                 if (accessUnit == null) continue;
                 if (!queueInputWhenAvailable(
                         activeCodec, activeInputQueue, activeOutputProgress,
-                        accessUnit)) break;
+                        accessUnit,callbackToken)) break;
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -347,7 +354,7 @@ final class FlexibleYuvMediaCodecDecoder {
     private boolean queueInputWhenAvailable(
             MediaCodec activeCodec, DecoderAccessUnitQueue activeInputQueue,
             DecoderOutputProgressTracker activeOutputProgress,
-            DecoderAccessUnitQueue.AccessUnit accessUnit) {
+            DecoderAccessUnitQueue.AccessUnit accessUnit,DecoderCallbackToken callbackToken) {
         try {
             while (running.get() && isActive(activeCodec)) {
                 if (DecoderAccessUnitQueue.isStale(
@@ -371,7 +378,7 @@ final class FlexibleYuvMediaCodecDecoder {
                     inputBufferCapacityDrops.incrementAndGet();
                     failInput(activeCodec, activeInputQueue, accessUnit,
                             "input_buffer_capacity",
-                            DecoderFallbackPolicy.FailureKind.CODEC_CONTRACT);
+                            DecoderFallbackPolicy.FailureKind.CODEC_CONTRACT,callbackToken);
                     return false;
                 }
                 input.clear();
@@ -395,7 +402,7 @@ final class FlexibleYuvMediaCodecDecoder {
             inputCodecExceptionDrops.incrementAndGet();
             failInput(activeCodec, activeInputQueue, accessUnit,
                     "input_codec_exception",
-                    DecoderFallbackPolicy.FailureKind.CODEC_EXCEPTION);
+                    DecoderFallbackPolicy.FailureKind.CODEC_EXCEPTION,callbackToken);
             Log.e(TAG, "decoder_input_codec_failure diagnostic="
                     + error.getDiagnosticInfo() + " recoverable=" + error.isRecoverable()
                     + " transient=" + error.isTransient(), error);
@@ -410,7 +417,7 @@ final class FlexibleYuvMediaCodecDecoder {
             inputStateExceptionDrops.incrementAndGet();
             failInput(activeCodec, activeInputQueue, accessUnit,
                     "input_state_exception",
-                    DecoderFallbackPolicy.FailureKind.STATE_EXCEPTION);
+                    DecoderFallbackPolicy.FailureKind.STATE_EXCEPTION,callbackToken);
             Log.e(TAG, "decoder_input_failure", error);
             return false;
         }
@@ -444,7 +451,7 @@ final class FlexibleYuvMediaCodecDecoder {
             DecoderAccessUnitQueue activeInputQueue,
             DecoderAccessUnitQueue.AccessUnit failed,
             String reason,
-            DecoderFallbackPolicy.FailureKind failureKind) {
+            DecoderFallbackPolicy.FailureKind failureKind,DecoderCallbackToken callbackToken) {
         if (!failActiveDecoder(activeCodec, reason, failureKind)) {
             QnnHtpBridge.discardNativeCompressedAccessUnit(
                     failed.presentationTimeUs,
@@ -452,8 +459,8 @@ final class FlexibleYuvMediaCodecDecoder {
             activeInputQueue.recycle(failed);
             return;
         }
-        QnnHtpBridge.discardNativeCompressedAccessUnit(
-                failed.presentationTimeUs, reason, true);
+        QnnHtpBridge.discardNativeCompressedAccessUnitAtGeneration(
+                failed.presentationTimeUs, reason, true,callbackToken.binding,callbackToken.stream,callbackToken.codec);
         activeInputQueue.recycle(failed);
         List<DecoderAccessUnitQueue.AccessUnit> flushed = activeInputQueue.closeAndDrain();
         inputFatalFlushDrops.addAndGet(flushed.size());
@@ -557,7 +564,7 @@ final class FlexibleYuvMediaCodecDecoder {
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     publishOutputFormat(
                             activeCodec, activeDescription,
-                            activeCodec.getOutputFormat());
+                            activeCodec.getOutputFormat(),activeOutputState.callbackToken);
                     continue;
                 }
                 if (index < 0) {
@@ -573,7 +580,7 @@ final class FlexibleYuvMediaCodecDecoder {
                 for (int drained = 0; drained < 16 && running.get() && isActive(activeCodec); ++drained) {
                     int newer = activeCodec.dequeueOutputBuffer(newerInfo, 0);
                     if (newer == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        publishOutputFormat(activeCodec, activeDescription, activeCodec.getOutputFormat());
+                        publishOutputFormat(activeCodec, activeDescription, activeCodec.getOutputFormat(),activeOutputState.callbackToken);
                         continue;
                     }
                     if (newer < 0) break;
@@ -692,7 +699,8 @@ final class FlexibleYuvMediaCodecDecoder {
         activeOutputState.consecutiveFailures++;
         boolean fatal = immediatelyFatal
                 || activeOutputState.consecutiveFailures >= 3;
-        QnnHtpBridge.discardNativeDecodedOutput(presentationTimeUs, reason, fatal);
+        DecoderCallbackToken token=activeOutputState.callbackToken;
+        QnnHtpBridge.discardNativeDecodedOutputAtGeneration(presentationTimeUs,reason,fatal,token.binding,token.stream,token.codec);
         if (fatal && !failActiveDecoder(
                 sourceCodec, reason,
                 DecoderFallbackPolicy.FailureKind.CODEC_CONTRACT)) {
@@ -712,7 +720,7 @@ final class FlexibleYuvMediaCodecDecoder {
     private void publishOutputFormat(
             MediaCodec sourceCodec,
             String sourceDescription,
-            MediaFormat format) {
+            MediaFormat format,DecoderCallbackToken token) {
         int colorFormat = readInteger(format, MediaFormat.KEY_COLOR_FORMAT, -1);
         int colorStandard = readInteger(
                 format, MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709);
@@ -722,10 +730,9 @@ final class FlexibleYuvMediaCodecDecoder {
         int height = readInteger(format, MediaFormat.KEY_HEIGHT, 0);
         synchronized (lifecycleLock) {
             if (codec != sourceCodec) return;
-            QnnHtpBridge.updateNativeH264JavaDecoderFormat(
-                    sourceDescription, colorFormat, colorStandard,
-                    colorRange, width, height);
         }
+        QnnHtpBridge.updateNativeH264JavaDecoderFormatAtGeneration(sourceDescription,colorFormat,colorStandard,
+                colorRange,width,height,token.binding,token.stream,token.codec);
         Log.i(TAG, "decoder_output_format " + format);
     }
 

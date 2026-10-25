@@ -441,6 +441,13 @@ endfunction()
             ../android_inference_benchmark/app/src/main/cpp shared/include
             "${VFDUAL_TEST_JNI_INCLUDE}" "${VFDUAL_TEST_JNI_INCLUDE}/win32")
         add_test(NAME vfdual_makcu_bridge_deadline_tests COMMAND vfdual_makcu_bridge_deadline_tests)
+        vfdual_add_portable_test(vfdual_makcu_runtime_calibration_tests
+            ../android_inference_benchmark/app/src/main/cpp/MakcuRuntimeCalibrationTests.cpp
+            ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
+            ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
+            ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
+        target_include_directories(vfdual_makcu_runtime_calibration_tests PRIVATE
+            "${VFDUAL_TEST_JNI_INCLUDE}" "${VFDUAL_TEST_JNI_INCLUDE}/win32")
     endif()
 
     vfdual_add_portable_test(vfdual_mobile_motion_planner_tests
@@ -523,6 +530,20 @@ vfdual_add_portable_test(vfdual_mobile_audit_regression_tests
     ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
     ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
     ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
+vfdual_add_portable_test(vfdual_mobile_round3_control_tests
+    ../android_inference_benchmark/app/src/main/cpp/MobileRound3ControlTests.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
+vfdual_add_portable_test(vfdual_ready_probe_session_tests
+    ../android_inference_benchmark/app/src/main/cpp/ReadyProbeSessionTests.cpp)
+vfdual_add_portable_test(vfdual_decoder_callback_ownership_tests
+    ../android_inference_benchmark/app/src/main/cpp/DecoderCallbackOwnershipTests.cpp)
+vfdual_add_portable_test(vfdual_never_working_route_guard_tests
+    ../android_inference_benchmark/app/src/main/cpp/NeverWorkingRouteGuardTests.cpp)
+vfdual_add_portable_test(vfdual_ready_probe_loopback_tests
+    ../android_inference_benchmark/app/src/main/cpp/ReadyProbeLoopbackTests.cpp)
+set_tests_properties(vfdual_ready_probe_loopback_tests PROPERTIES SKIP_RETURN_CODE 77)
 vfdual_add_portable_test(vfdual_mobile_quantization_terminal_tests
     ../android_inference_benchmark/app/src/main/cpp/MobileQuantizationTerminalTests.cpp
     ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
@@ -796,12 +817,43 @@ target_include_directories(vfdual_host_operation_ownership_tests PRIVATE host/wi
 if(WIN32)
     add_executable(VisionForgeRawMouseProbe tools/raw_mouse_probe_main.cpp)
     target_link_libraries(VisionForgeRawMouseProbe PRIVATE user32)
+    vfdual_add_portable_test(vfdual_host_network_combination_tests
+        host/windows/tests/host_network_combination_tests.cpp
+        host/windows/src/host_direct_link_provisioner.cpp
+        host/windows/src/host_firewall_provisioner.cpp)
+    target_include_directories(vfdual_host_network_combination_tests PRIVATE host/windows/include)
+    target_link_libraries(vfdual_host_network_combination_tests PRIVATE
+        ws2_32 iphlpapi ole32 oleaut32 shell32 uuid advapi32 bcrypt crypt32)
+    vfdual_add_portable_test(vfdual_host_firewall_com_store_tests
+        host/windows/tests/host_firewall_com_store_tests.cpp)
+    target_include_directories(vfdual_host_firewall_com_store_tests PRIVATE host/windows/include)
+    target_link_libraries(vfdual_host_firewall_com_store_tests PRIVATE
+        ws2_32 ole32 oleaut32 shell32 uuid advapi32 bcrypt crypt32)
+    vfdual_add_portable_test(vfdual_host_direct_link_snapshot_tests
+        host/windows/tests/host_direct_link_snapshot_tests.cpp
+        host/windows/src/host_firewall_provisioner.cpp)
+    target_include_directories(vfdual_host_direct_link_snapshot_tests PRIVATE host/windows/include)
+    target_link_libraries(vfdual_host_direct_link_snapshot_tests PRIVATE
+        ws2_32 iphlpapi ole32 oleaut32 shell32 uuid advapi32 bcrypt crypt32)
+    vfdual_add_portable_test(vfdual_host_adapter_identity_tests
+        host/windows/tests/host_adapter_identity_tests.cpp
+        host/windows/src/host_firewall_provisioner.cpp)
+    target_include_directories(vfdual_host_adapter_identity_tests PRIVATE host/windows/include)
+    target_link_libraries(vfdual_host_adapter_identity_tests PRIVATE
+        setupapi ws2_32 iphlpapi ole32 oleaut32 shell32 uuid advapi32 bcrypt crypt32)
 endif()
 
 # The native contracts intentionally use the standard assert macro. Release
 # configurations define NDEBUG globally, so undefine it for test executables
 # only; otherwise CTest can report a false pass without evaluating a check.
 get_property(vfdual_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+if(WIN32)
+    foreach(vfdual_adapter_target IN ITEMS VisionForgeHost
+            vfdual_host_direct_link_policy_tests vfdual_host_network_combination_tests
+            vfdual_host_direct_link_snapshot_tests)
+        target_link_libraries(${vfdual_adapter_target} PRIVATE setupapi)
+    endforeach()
+endif()
 
 # Fail configuration when a new mobile native test has no build entry. The
 # one desktop JNI translation unit requires Windows JNI headers; ARM pixel
@@ -822,8 +874,10 @@ foreach(vfdual_test_source IN LISTS vfdual_mobile_test_sources)
     list(FIND vfdual_registered_test_sources "${vfdual_test_absolute}" vfdual_registration)
     if(vfdual_registration EQUAL -1)
         get_filename_component(vfdual_test_name "${vfdual_test_source}" NAME)
-        if(vfdual_test_name STREQUAL "MakcuBridgeDeadlineTests.cpp" AND
-                NOT TARGET vfdual_makcu_bridge_deadline_tests)
+        if((vfdual_test_name STREQUAL "MakcuBridgeDeadlineTests.cpp" AND
+                NOT TARGET vfdual_makcu_bridge_deadline_tests) OR
+           (vfdual_test_name STREQUAL "MakcuRuntimeCalibrationTests.cpp" AND
+                NOT TARGET vfdual_makcu_runtime_calibration_tests))
             message(STATUS "Explicit test exclusion: ${vfdual_test_name} requires Windows JNI headers")
         else()
             message(FATAL_ERROR "Native test lacks a target or explicit exclusion: ${vfdual_test_source}")

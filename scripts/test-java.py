@@ -26,6 +26,10 @@ names.append('MobileRuntimeRecoverySelfTest')
 names.append('TransportLifecycleSelfTest')
 names.append('MobileCalibrationPersistencePolicySelfTest')
 names.append('MobileTransportStatusCacheSelfTest')
+names.append('AssetFailureOriginSelfTest')
+names.append('Cat6MouseButtonDatagramReceiverSelfTest')
+names.append('WirelessHostRediscoveryPolicySelfTest')
+names.append('DecoderCallbackTokenSelfTest')
 runner=out/'LocalBehaviorTests.java'
 runner.write_text('''package com.visionforge.inferencebenchmark;
 public final class LocalBehaviorTests {

@@ -15,6 +15,9 @@ class MobilePendingMotion final {
     // extrema over all plausible delays, including mixed-sign report history.
     float x{}, y{}; std::uint32_t reports{};
     float minimum_x{}, maximum_x{}, minimum_y{}, maximum_y{};
+    // Counts of nonzero reports that may still be unseen on each axis.
+    // Opposite reports remain risk even when their signed sum cancels to zero.
+    std::uint32_t reports_x{},reports_y{};
   };
   static constexpr std::uint64_t kExpectedVisibilityUs = 32'000U;
   static constexpr std::uint64_t kMaximumVisibilityUs = 100'000U;
@@ -49,19 +52,23 @@ class MobilePendingMotion final {
     for (std::size_t i = 0; i < size_; ++i) {
       if (observed_at_us >= entries_[i].at_us && observed_at_us-entries_[i].at_us >= delay) continue;
       result.x += entries_[i].x; result.y += entries_[i].y; ++result.reports;
+      result.reports_x+=entries_[i].x!=0;result.reports_y+=entries_[i].y!=0;
     }
     result.minimum_x=result.maximum_x=result.x;
     result.minimum_y=result.maximum_y=result.y;
     if(low==high) return result;
     const auto include=[&](std::uint64_t hypothesis) {
-      float x{},y{}; std::uint32_t reports{};
+      float x{},y{}; std::uint32_t reports{},reports_x{},reports_y{};
       for(std::size_t i{};i<size_;++i) {
         if(observed_at_us>=entries_[i].at_us && observed_at_us-entries_[i].at_us>=hypothesis) continue;
         x+=entries_[i].x; y+=entries_[i].y; ++reports;
+        reports_x+=entries_[i].x!=0;reports_y+=entries_[i].y!=0;
       }
       result.minimum_x=std::min(result.minimum_x,x); result.maximum_x=std::max(result.maximum_x,x);
       result.minimum_y=std::min(result.minimum_y,y); result.maximum_y=std::max(result.maximum_y,y);
       result.reports=std::max(result.reports,reports);
+      result.reports_x=std::max(result.reports_x,reports_x);
+      result.reports_y=std::max(result.reports_y,reports_y);
     };
     include(low); include(high);
     // Pending sums change only just after an entry's visibility boundary.
