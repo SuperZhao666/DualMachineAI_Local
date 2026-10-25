@@ -29,7 +29,7 @@
   },
   "runtime": "QNN HTP v75 W8A16 / U16 input / FP32 split outputs",
   "device": "Xiaomi 14 Pro SM8650",
-  "app_version": "1.5.16-state-cache",
+  "app_version": "1.5.17-round3",
   "capture_region": {
     "width": 640,
     "height": 640,
@@ -38,7 +38,7 @@
     "transport_height": 640
   },
   "head_location": "geometric estimate at box y=0.18; not trained head localization",
-  "status": "state_cache_hotfix_built_code67_code66_running_during_gameplay",
+  "status": "candidate_built_not_deployed_performance_gate_not_passed",
   "archive_audit": "audit/model640-20261022/model-input-audit.json",
   "quantization": {
     "calibration": "audit/model640-20261022/corpus.json",
@@ -67,7 +67,7 @@
   "portable_model_scope": "This APK runs the bundled QNN HTP graph on the supported Xiaomi phone; split ONNX is retained in the source package for conversion/reference validation, not bundled as a portable runtime asset.",
   "user_acceptance_met": false,
   "active_pixel_projection_enabled": false,
-  "current_validation": "audit/report-fixes-20261025/candidate-validation.json",
+  "current_validation": "audit/round3-20261025/candidate-validation.json",
   "rollback": {
     "reason": "user_reported_1.5.3_gameplay_jitter_regression",
     "rejected_version": "1.5.3-mixed640",
@@ -76,8 +76,11 @@
     "native_baseline_apk_sha256": "b89a742a28dc3ed6a04164290cc2865c79dd52054851b65ab224b0bf8e61b405",
     "scope": "Historical 1.5.4 restore only. The 1.5.5 candidate rebuilds native code from source with control-selection diagnostics and short report locks; it does not reuse the baseline native binary."
   },
-  "candidate_scope": "Two-report correctness fixes, explicit fast-stranger policy, original native640/body18%/calibration. Full native suite has one unmet historical severe-dropout performance target; measured tradeoffs remain and physical gameplay is not accepted.",
+  "candidate_scope": "Third-round report correctness fixes; unchanged W8A16/native640/body18%. The formal performance gate is not passed: two historical servo failures and a new ordinary30FPS RMS failure remain. Built candidate, not installed or accepted in gameplay.",
   "current_deployment": "audit/report-fixes-20261025/delivery.json",
-  "current_installed_version": "1.5.15-audit-fixes",
-  "state_cache_hotfix_validation": "audit/report-fixes-20261025/state-cache-candidate.json"
+  "current_installed_version": "1.5.16-state-cache",
+  "state_cache_hotfix_validation": "audit/report-fixes-20261025/state-cache-candidate.json",
+  "current_installed_version_evidence": "audit/report-fixes-20261025/install-code67-20261025T095644Z; last verified earlier today, not refreshed live because current ADB discovery is empty",
+  "round3_candidate_delivery": "dist/candidates/round3-20261025/validation.json",
+  "round3_candidate_installed": false
 }
