@@ -78,8 +78,8 @@ android {
         applicationId 'com.visionforge.mobile.local'
         minSdk 29
         targetSdk 35
-        versionCode 65
-        versionName '1.5.14-far-snap'
+        versionCode 66
+        versionName '1.5.15-audit-fixes'
         testInstrumentationRunner 'com.visionforge.inferencebenchmark.OverwatchBenchmark'
         manifestPlaceholders.benchmarkTargetProcess = project.hasProperty('headlessBenchmark') ?
                 'com.visionforge.mobile.local:benchmark' : 'com.visionforge.mobile.local'
