@@ -123,7 +123,7 @@ final class PortableModelAssetInstaller {
                 digest.update(buffer, 0, read);
                 copied += read;
                 if (copied > descriptor.expectedBytes) {
-                    throw new IOException("Portable model asset exceeds expected size");
+                    throw new MobilePackagedAssetException("Portable model asset exceeds expected size");
                 }
             }
             output.getFD().sync();
@@ -135,7 +135,7 @@ final class PortableModelAssetInstaller {
         if (copied != descriptor.expectedBytes
                 || !descriptor.sha256.equals(actualSha256)) {
             deleteQuietly(temporary);
-            throw new IOException(
+            throw new MobilePackagedAssetException(
                     "Portable model asset integrity mismatch: "
                             + descriptor.assetName);
         }

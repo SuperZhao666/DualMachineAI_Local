@@ -8,8 +8,8 @@ final class ControlProfile implements ControlProfilePort {
     private static final String LEGACY_GAIN = "gain";
     private static final String LEGACY_DEADZONE = "deadzone";
     private static final String LEGACY_MAXIMUM_DELTA = "maximum_delta";
-    private static final float MIN_GAIN = 0.01f;
-    private static final float MAX_GAIN = 2.00f;
+    private static final float MIN_GAIN = MobileControlTuning.MINIMUM_GAIN;
+    private static final float MAX_GAIN = MobileControlTuning.MAXIMUM_GAIN;
     private static final float MAX_DEADZONE = 64.0f;
     private static final float MIN_PERSONAL_SCALE = 0.50f;
     private static final float MAX_PERSONAL_SCALE = 1.50f;
@@ -38,6 +38,7 @@ final class ControlProfile implements ControlProfilePort {
                 MobileProfileStorageKeys.CONTROL_STORE, Context.MODE_PRIVATE);
         ModelViewportPreferenceMigration.control(store);
         migrateLegacyControlTuning();
+        migrateEffectiveGain();
         selectTargetProfileInternal(initialModel, initialAimTarget, true);
         String persistedControlTrigger = store.getString(
                 MobileProfileStorageKeys.CONTROL_TRIGGER, null);
@@ -74,7 +75,7 @@ final class ControlProfile implements ControlProfilePort {
     }
 
     @Override
-    public void setGain(float value) { gain = clamp(value, MIN_GAIN, MAX_GAIN); persist(); }
+    public void setGain(float value) { gain = MobileControlTuning.effectiveGain(value); persist(); }
 
     @Override
     public void setDeadzone(float value) { deadzonePixels = clamp(value, 0.0f, MAX_DEADZONE); persist(); }
@@ -91,7 +92,7 @@ final class ControlProfile implements ControlProfilePort {
     @Override
     public void setValues(float gain, float deadzonePixels, int maximumAxisDelta,
                           int switchConfirmationMillis) {
-        this.gain = clamp(gain, MIN_GAIN, MAX_GAIN);
+        this.gain = MobileControlTuning.effectiveGain(gain);
         this.deadzonePixels = clamp(deadzonePixels, 0.0f, MAX_DEADZONE);
         this.maximumAxisDelta = clamp(maximumAxisDelta, 1, 127);
         this.switchConfirmationMillis =
@@ -285,12 +286,29 @@ final class ControlProfile implements ControlProfilePort {
         int maximumFallback = model.defaultMaximumAxisDelta;
         int switchConfirmationFallback =
                 MobileControlTuning.standard(model).switchConfirmationMillis;
-        gain = clamp(store.getFloat(gainKey(model), gainFallback), MIN_GAIN, MAX_GAIN);
+        gain = MobileControlTuning.effectiveGain(store.getFloat(gainKey(model), gainFallback));
         deadzonePixels = clamp(store.getFloat(deadzoneKey(model), deadzoneFallback),
                 0.0f, MAX_DEADZONE);
         maximumAxisDelta = clamp(store.getInt(maximumDeltaKey(model), maximumFallback), 1, 127);
         switchConfirmationMillis = MobileControlTuning.sanitizeSwitchConfirmationMillis(
                 store.getInt(switchConfirmationKey(model), switchConfirmationFallback));
+    }
+
+    private void migrateEffectiveGain() {
+        // Idempotent and separate from the old preset migration: do not replay
+        // preset changes for existing custom profiles when fixing this contract.
+        android.content.SharedPreferences.Editor editor = null;
+        for (MobileModelCatalog.Profile profile : MobileModelCatalog.PRODUCTION_SELECTABLE) {
+            String key = gainKey(profile);
+            if (!store.contains(key)) continue;
+            float old = store.getFloat(key, profile.defaultControlGain);
+            float effective = MobileControlTuning.effectiveGain(old);
+            if (Float.compare(old, effective) != 0) {
+                if (editor == null) editor = store.edit();
+                editor.putFloat(key, effective);
+            }
+        }
+        if (editor != null) editor.apply();
     }
 
     private static String gainKey(MobileModelCatalog.Profile profile) {

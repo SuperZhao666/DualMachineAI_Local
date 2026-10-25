@@ -17,6 +17,8 @@ final class MobileResponseCalibrationStore {
     private JSONObject restoredRecord;
     private String incompatibleTarget="";
     private boolean incompatibleSaveReported;
+    private final MobileCalibrationPersistencePolicy.SkipThrottle saveSkipThrottle =
+            new MobileCalibrationPersistencePolicy.SkipThrottle();
     MobileResponseCalibrationStore(Context context,MobileRuntimeEventSink events) {
         this.context=context;this.events=events;
     }
@@ -136,7 +138,15 @@ final class MobileResponseCalibrationStore {
             incompatibleSaveReported=true;return;
         }
         double[] v=QnnHtpBridge.getNativeControlCalibration();
-        if (v==null || v.length!=7 || v[5]!=1 || v[6]<=0) return;
+        MobileCalibrationPersistencePolicy.Decision decision=MobileCalibrationPersistencePolicy.evaluate(v);
+        if (!decision.writable) {
+            String scope=runtime.activeModel().token+"|"+runtime.activeOutputRoute().storageToken;
+            if (saveSkipThrottle.shouldReport(scope,System.nanoTime()/1_000_000L))
+                events.write("control_calibration_save_skipped","reason="+decision.reason
+                        +" existing_record_preserved=true automatic_overwrite=false scope="+scope);
+            return;
+        }
+        v=decision.values;
         String signature=runtime.activeModel().token+"|"+runtime.activeOutputRoute().storageToken+"|"+java.util.Arrays.toString(v);
         if (signature.equals(savedSignature)) return;
         long now=System.currentTimeMillis();

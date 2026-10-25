@@ -17,6 +17,7 @@ final class MobileRuntimeSnapshot {
     final String qnnReport;
     final String makcuReport;
     final boolean receiverRunning;
+    final boolean requiresFullRecovery;
     final boolean decoderReady;
     final boolean qnnReady;
     final String qnnRuntimeLabel;
@@ -68,6 +69,10 @@ final class MobileRuntimeSnapshot {
         this.qnnReport = qnnReport;
         this.makcuReport = makcuReport;
         receiverRunning = containsReady(videoReport, "running");
+        // A stopped receiver after successful start is terminal for that native
+        // generation. Missing/stale FPS is deliberately not a fatal signal.
+        requiresFullRecovery = (MobileDiagnosticFieldParser.hasField(videoReport, "running")
+                && !receiverRunning) || containsReady(decoderReport, "decoder_failed");
         decoderReady = containsReady(decoderReport, "configured");
         qnnReady = containsReady(qnnReport, "ready");
         qnnUsesSplitOutput = qnnReport.contains("outputs=FP32 split")

@@ -5,6 +5,9 @@ public final class MobileControlTuning {
     public static final int PERSISTENCE_VERSION = 2;
     public static final int MINIMUM_SWITCH_CONFIRMATION_MILLIS = 10;
     public static final int MAXIMUM_SWITCH_CONFIRMATION_MILLIS = 100;
+    // Fraction of position error corrected per 60 Hz tick, not a speed multiplier.
+    public static final float MINIMUM_GAIN = 0.01f;
+    public static final float MAXIMUM_GAIN = 0.95f;
 
     private static final float LEGACY_DEFAULT_GAIN = 0.36f;
     private static final float LEGACY_STANDARD_GAIN = 0.10f;
@@ -20,6 +23,13 @@ public final class MobileControlTuning {
             new Values(0.50f, 0.35f, 96, 35);
 
     private MobileControlTuning() {}
+
+    /** Matches the deployed servo's former effective clamp, preserving old behavior. */
+    public static float effectiveGain(float value) {
+        return Float.isFinite(value)
+                ? Math.max(MINIMUM_GAIN, Math.min(MAXIMUM_GAIN, value))
+                : OVERWATCH_STANDARD.gain;
+    }
 
     public static Values standard(MobileModelCatalog.Profile model) {
         return OVERWATCH_STANDARD;

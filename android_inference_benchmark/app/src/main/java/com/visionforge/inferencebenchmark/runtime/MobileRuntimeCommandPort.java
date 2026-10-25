@@ -11,6 +11,12 @@ public interface MobileRuntimeCommandPort {
 
     void setActivityForeground(boolean foreground);
 
+    default long claimActivity() { return 0L; }
+    default void setActivityForeground(boolean foreground, long owner) {
+        setActivityForeground(foreground);
+    }
+    default void beginActivityConfigurationChange(long owner) {}
+
 
 
 

@@ -37,9 +37,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Set;
 
 /**
  * Composition root for the Android half of the dual-machine architecture.
@@ -111,7 +109,15 @@ public final class MainActivity extends Activity implements MobileAppActions {
     private boolean activityStarted;
     private volatile boolean activityDestroyed;
     private MobileRuntimeBinding runtimeBinder;
+    private long runtimeActivityOwner;
     private boolean runtimeServiceBound;
+    private final java.util.concurrent.ExecutorService exportWorker =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean exportingLog =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile java.util.concurrent.Future<?> logExportTask;
+    private volatile OutputStream logExportStream;
+    private volatile android.os.CancellationSignal logExportCancellation;
 
     private final ServiceConnection runtimeServiceConnection =
             new ServiceConnection() {
@@ -124,8 +130,9 @@ public final class MainActivity extends Activity implements MobileAppActions {
                         return;
                     }
                     runtimeBinder = (MobileRuntimeBinding) service;
+                    runtimeActivityOwner = runtimeBinder.claimActivity();
                     runtimeServiceBound = true;
-                    runtimeBinder.setActivityForeground(activityStarted);
+                    runtimeBinder.setActivityForeground(activityStarted, runtimeActivityOwner);
                     refreshStates("");
                 }
 
@@ -150,7 +157,6 @@ public final class MainActivity extends Activity implements MobileAppActions {
 
     private final MobileThroughputTracker throughputTracker = new MobileThroughputTracker();
     private final MobileRuntimeMetricsSampler metricsSampler = new MobileRuntimeMetricsSampler();
-    private final Set<String> nativeReportFailures = new HashSet<>();
     private final Handler stateRefreshHandler = new Handler(Looper.getMainLooper());
     private final Runnable stateRefreshTask = new Runnable() {
         @Override
@@ -576,14 +582,10 @@ public final class MainActivity extends Activity implements MobileAppActions {
             latestNote = note;
             latestNoteElapsedMillis = monotonicMillis;
         }
-        String video = readNativeReport(
-                "video_receiver", QnnHtpBridge::getNativeVideoReceiverReport);
-        String decoder = readNativeReport(
-                "mediacodec", QnnHtpBridge::getNativeH264DecoderReport);
-        String qnn = readNativeReport(
-                "qnn_htp", QnnHtpBridge::getNativeQnnRealtimeReport);
-        String makcu = controlRuntime.makcuReport();
-        MobileRuntimeSnapshot snapshot = MobileRuntimeSnapshot.from(video, decoder, qnn, makcu);
+        MobileRuntimeReportStore.Sample sample = MobileRuntimeReportStore.snapshot();
+        MobileRuntimeSnapshot snapshot = sample.snapshot;
+        boolean sampleFresh = sample.sampledAtMillis > 0 && monotonicMillis >= sample.sampledAtMillis
+                && monotonicMillis - sample.sampledAtMillis <= MobileRuntimeSnapshot.LIVE_VIDEO_MAX_AGE_MILLIS;
         MobileRuntimeReadModel runtimeStatus = MobileRuntimeReadModelStore.snapshot();
         String ethernetDiagnostics = MobileRuntimeReadModelStore.ethernetDiagnostics();
         MobileRuntimePhase previousRuntimeStatusPhase =
@@ -619,14 +621,16 @@ public final class MainActivity extends Activity implements MobileAppActions {
         if (metricsEvent != null) {
             eventLogger.write(
                     "mobile_pipeline_metrics",
-                    controlRuntime.inferenceAuditDetail() + " " + metricsEvent);
+                    controlRuntime.inferenceAuditDetail() + " " + metricsEvent
+                            + " report_generation=" + sample.generation
+                            + " report_age_ms=" + (monotonicMillis - sample.sampledAtMillis));
         }
         MobileUiStateMapper.Input input = new MobileUiStateMapper.Input();
         input.receiverServiceReady = runtimeStatus.phase == MobileRuntimePhase.READY
                 || runtimeStatus.phase == MobileRuntimePhase.STARTING
                 || runtimeStatus.phase == MobileRuntimePhase.RUNNING;
         input.receiverRunning = snapshot.receiverRunning;
-        input.videoLinkLive = snapshot.videoLinkLive;
+        input.videoLinkLive = sampleFresh && snapshot.videoLinkLive;
         input.decoderReady = snapshot.decoderReady;
         input.qnnReady = snapshot.qnnReady;
         input.makcuReady = snapshot.makcuReady;
@@ -699,22 +703,6 @@ public final class MainActivity extends Activity implements MobileAppActions {
             return ACTIVE_STATUS_REFRESH_MILLIS;
         }
         return IDLE_STATUS_REFRESH_MILLIS;
-    }
-
-    private String readNativeReport(String component, NativeReportReader reader) {
-        try {
-            String report = reader.read();
-            nativeReportFailures.remove(component);
-            return report;
-        } catch (RuntimeException | LinkageError failure) {
-            String stack = MobileThrowableDiagnostics.format(failure);
-            if (nativeReportFailures.add(component)) {
-                eventLogger.write(
-                        "mobile_ui_native_report_failure",
-                        "component=" + component + " stack={" + stack + "}");
-            }
-            return "report_unavailable component=" + component + " stack={" + stack + "}";
-        }
     }
 
     private String ethernetStatusDetail(
@@ -941,19 +929,37 @@ public final class MainActivity extends Activity implements MobileAppActions {
             return;
         }
         Uri destination = data.getData();
-        try (OutputStream output = getContentResolver().openOutputStream(
-                     destination, "wt")) {
-            if (output == null) throw new IOException("log_output_stream_unavailable");
-            long exportedBytes = eventLogger.exportTo(output);
-            eventLogger.write("mobile_runtime_log_export_finished",
-                    "result=success bytes=" + exportedBytes);
-            refreshStates(getString(R.string.status_runtime_log_exported));
-        } catch (IOException | RuntimeException failure) {
-            eventLogger.write("mobile_runtime_log_export_finished",
-                    "result=failed failure_type="
-                            + failure.getClass().getSimpleName());
-            refreshStates(getString(R.string.status_runtime_log_export_failed));
-        }
+        if (!exportingLog.compareAndSet(false, true)) return;
+        android.content.ContentResolver resolver = getApplicationContext().getContentResolver();
+        android.os.CancellationSignal cancellation = new android.os.CancellationSignal();
+        logExportCancellation = cancellation;
+        eventLogger.write("mobile_runtime_log_export_started", "state=copying destination_selected=true");
+        refreshStates(getString(R.string.status_runtime_log_exporting));
+        logExportTask = exportWorker.submit(() -> {
+            int status;
+            try (android.os.ParcelFileDescriptor descriptor = resolver.openFileDescriptor(
+                        destination, "wt", cancellation)) {
+                if (descriptor == null) throw new IOException("log_output_stream_unavailable");
+                try (OutputStream output = new android.os.ParcelFileDescriptor.AutoCloseOutputStream(descriptor)) {
+                    logExportStream = output;
+                    long exportedBytes = eventLogger.exportTo(output);
+                    eventLogger.write("mobile_runtime_log_export_finished", "result=success bytes=" + exportedBytes);
+                    status = R.string.status_runtime_log_exported;
+                }
+            } catch (IOException | RuntimeException failure) {
+                eventLogger.write("mobile_runtime_log_export_finished", "result="
+                        + (cancellation.isCanceled() ? "cancelled" : "failed")
+                        + " failure_type=" + failure.getClass().getSimpleName());
+                status = R.string.status_runtime_log_export_failed;
+            } finally {
+                logExportStream = null;
+                exportingLog.set(false);
+            }
+            final int message = status;
+            stateRefreshHandler.post(() -> {
+                if (!activityDestroyed) refreshStates(getString(message));
+            });
+        });
     }
 
     private String readBoundedUtf8(Uri uri) throws IOException {
@@ -1074,7 +1080,7 @@ public final class MainActivity extends Activity implements MobileAppActions {
         activityStarted = true;
         if (uiPreviewOnly) return;
         if (runtimeServiceBound && runtimeBinder != null) {
-            runtimeBinder.setActivityForeground(true);
+            runtimeBinder.setActivityForeground(true, runtimeActivityOwner);
             return;
         }
         if (runtimeServiceBound) return;
@@ -1103,7 +1109,7 @@ public final class MainActivity extends Activity implements MobileAppActions {
         super.onResume();
         if (uiPreviewOnly) return;
         if (runtimeBinder != null) {
-            runtimeBinder.setActivityForeground(true);
+            runtimeBinder.setActivityForeground(true, runtimeActivityOwner);
         }
         MobileRuntimeService.ensureRunning(this);
         controlRuntime = MobileControlRuntime.get(this);
@@ -1139,15 +1145,14 @@ public final class MainActivity extends Activity implements MobileAppActions {
 
     @Override
     protected void onStop() {
-        // Rotation and other configuration changes recreate the Activity while
-        // the same foreground UI remains visible.  Publishing a transient
-        // the replacement Activity resumes the local pipeline.
+        // Configuration recreation transfers this owner's visible lease;
+        // ordinary hiding still revokes output synchronously before unbinding.
         if (!isChangingConfigurations() && runtimeBinder != null) {
-            runtimeBinder.setActivityForeground(false);
+            runtimeBinder.setActivityForeground(false, runtimeActivityOwner);
+        } else if (runtimeBinder != null) {
+            runtimeBinder.beginActivityConfigurationChange(runtimeActivityOwner);
         }
         activityStarted = false;
-        if (runtimeBinder != null) {
-        }
         runtimeBinder = null;
         if (runtimeServiceBound) {
             runtimeServiceBound = false;
@@ -1160,6 +1165,21 @@ public final class MainActivity extends Activity implements MobileAppActions {
     protected void onDestroy() {
         boolean changingConfigurations = isChangingConfigurations();
         activityDestroyed = true;
+        java.util.concurrent.Future<?> export = logExportTask;
+        if (export != null) export.cancel(true);
+        exportWorker.shutdownNow();
+        android.os.CancellationSignal cancellation = logExportCancellation;
+        OutputStream stream = logExportStream;
+        if (cancellation != null || stream != null) {
+            // A document provider may ignore thread interruption. Closing the
+            // descriptor is cancellation I/O and must also stay off the UI.
+            Thread cancel = new Thread(() -> {
+                if (cancellation != null) cancellation.cancel();
+                try { if (stream != null) stream.close(); } catch (IOException ignored) { }
+            }, "visionforge-export-cancel");
+            cancel.setDaemon(true);
+            cancel.start();
+        }
         stateRefreshHandler.removeCallbacks(stateRefreshTask);
         if (eventLogger != null) {
             eventLogger.write("mobile_app_stopped",
@@ -1171,8 +1191,4 @@ public final class MainActivity extends Activity implements MobileAppActions {
         super.onDestroy();
     }
 
-    @FunctionalInterface
-    private interface NativeReportReader {
-        String read();
-    }
 }

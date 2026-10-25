@@ -33,6 +33,13 @@ public final class MobileRuntimeService extends Service {
     private java.util.concurrent.ScheduledFuture<?> healthTask;
     private final java.util.concurrent.atomic.AtomicLong topologyRevision = new java.util.concurrent.atomic.AtomicLong();
     private final Object modelPreparationLock = new Object();
+    private final MobileRuntimeAuthorization authorization = new MobileRuntimeAuthorization();
+    private final MobileRuntimeRetryPolicy retry = new MobileRuntimeRetryPolicy();
+    private final MobileActivityOwnership activityOwnership = new MobileActivityOwnership();
+    private long reportGeneration;
+    private final MobileRuntimeReportStore.Cursor reportCursor = new MobileRuntimeReportStore.Cursor();
+    private final java.util.concurrent.ExecutorService reportWorker = Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean reportPending = new java.util.concurrent.atomic.AtomicBoolean();
     private final MobileTransportCatalog transportCatalog = new MobileTransportCatalog();
     private final LocalBinder binder = new LocalBinder();
     private final MobileRuntimeCompositionRoot composition = new MobileRuntimeCompositionRoot(binder);
@@ -40,7 +47,6 @@ public final class MobileRuntimeService extends Service {
     private volatile boolean foreground;
     private boolean running;
     private long revision;
-    private long nextAttempt;
     private volatile MobileTransportEndpoint activeEndpoint;
     private MobileEventLogger events;
     private MobileResponseCalibrationStore responseCalibration;
@@ -70,10 +76,14 @@ public final class MobileRuntimeService extends Service {
 
     public final class LocalBinder extends Binder implements MobileRuntimeBinding {
         @Override public void setActivityForeground(boolean value) {
-            foreground = value;
-            // Close physical output immediately; queued model preparation may still finish.
-            if (!value && controlRuntime != null) controlRuntime.failClosed("activity_hidden");
-            submit(() -> { if (!value) stopPipeline("activity_hidden"); else nextAttempt=0; });
+            setForeground(value, "activity_hidden");
+        }
+        @Override public long claimActivity() { return activityOwnership.claim(); }
+        @Override public void setActivityForeground(boolean value, long owner) {
+            activityOwnership.ifCurrent(owner, () -> setForeground(value, "activity_hidden"));
+        }
+        @Override public void beginActivityConfigurationChange(long owner) {
+            activityOwnership.beginHandoff(owner);
         }
         @Override public void selectGameModel(String token) {
             submit(() -> {
@@ -83,7 +93,7 @@ public final class MobileRuntimeService extends Service {
                 stopPipeline("model_changed");
                 controlRuntime.selectModel(model);
                 responseCalibration.restore(controlRuntime);
-                nextAttempt=0;
+                retry.reset();
             });
         }
         @Override public void selectOutputRoute(String token) {
@@ -100,6 +110,18 @@ public final class MobileRuntimeService extends Service {
         @Override public void runDebugBluetoothHidMoveProbe(int x,int y,int reports,int interval) {
             submit(() -> controlRuntime.runDebugBluetoothHidMoveProbe(x,y,reports,interval));
         }
+    }
+
+    private void setForeground(boolean value, String reason) {
+        final long generation = authorization.updateForeground(value, () -> {
+            foreground = false;
+            if (controlRuntime != null) controlRuntime.failClosed(reason);
+        });
+        foreground = authorization.foreground();
+        submit(() -> {
+            // A delayed hidden callback must not stop a newly visible generation.
+            if (!value && authorization.generation() == generation) stopPipeline(reason);
+        });
     }
 
     @Override public void onCreate() {
@@ -159,18 +181,24 @@ public final class MobileRuntimeService extends Service {
     }
     @Override public int onStartCommand(Intent intent,int flags,int id) {
         if(intent!=null && ACTION_STOP.equals(intent.getAction())) {
-            foreground=false;
-            if(controlRuntime!=null) controlRuntime.failClosed("user_stopped");
+            setForeground(false, "user_stopped");
             stopSelf();
         }
         return START_NOT_STICKY;
     }
     @Override public IBinder onBind(Intent intent) { return binder; }
     @Override public boolean onUnbind(Intent intent) {
-        binder.setActivityForeground(false); return true;
+        final long handoff = activityOwnership.takeHandoff();
+        if (handoff == 0L) binder.setActivityForeground(false);
+        else worker.schedule(() -> {
+            // A configuration handoff is bounded if the replacement never binds.
+            if (!destroying) activityOwnership.ifCurrent(handoff,
+                    () -> setForeground(false, "configuration_handoff_expired"));
+        }, 2, TimeUnit.SECONDS);
+        return true;
     }
     @Override public void onTaskRemoved(Intent intent) {
-        foreground=false; if(controlRuntime!=null) controlRuntime.failClosed("task_removed"); stopSelf();
+        setForeground(false, "task_removed"); stopSelf();
     }
     private void changed(Network network,boolean lost) { topologyRevision.incrementAndGet(); submit(() -> updateNetwork(network,lost)); }
     private void updateNetwork(Network network,boolean lost) {
@@ -187,7 +215,8 @@ public final class MobileRuntimeService extends Service {
         events.write("local_network_update", "lost=" + lost + " network=" + network.getNetworkHandle()
                 + " previous={" + (previous == null ? "none" : previous.detail()) + "} selected={"
                 + (selected == null ? "none" : selected.detail()) + "}");
-        nextAttempt=0;
+        // Capability/link callbacks for the same route cannot erase terminal
+        // model failures or bypass a transient completion-based backoff.
     }
     private void submit(Runnable action) {
         if(destroying) return;
@@ -213,25 +242,79 @@ public final class MobileRuntimeService extends Service {
             stopPipeline("local_route_changed");
         controlRuntime.updateTransportEndpoint(endpoint);
         if(!foreground || endpoint==null || !endpoint.isReadyForDataPlane()) return;
-        if(!running && SystemClock.elapsedRealtime()>=nextAttempt) startPipeline(endpoint);
+        if(!running && retry.mayAttempt(SystemClock.elapsedRealtime())) startPipeline(endpoint);
         if(!running) return;
-        MobileRuntimeSnapshot snapshot=MobileRuntimeSnapshot.from(
-                QnnHtpBridge.getNativeVideoReceiverReport(),QnnHtpBridge.getNativeH264DecoderReport(),
-                QnnHtpBridge.getNativeQnnRealtimeReport(),controlRuntime.makcuReport());
-        boolean healthy=foreground && snapshot.videoLinkLive && snapshot.decoderReady
+        final long sampledLifecycle = authorization.generation();
+        final long sampledPipeline = reportGeneration;
+        requestReportSample(sampledLifecycle, sampledPipeline);
+        consumeCurrentSample();
+    }
+
+    private void consumeCurrentSample() {
+        if (!running || destroying) return;
+        final long sampledLifecycle = authorization.generation();
+        final long sampledPipeline = reportGeneration;
+        MobileRuntimeReportStore.Sample sampled = MobileRuntimeReportStore.snapshot();
+        if (sampled.generation != sampledPipeline || sampled.lifecycleGeneration != sampledLifecycle
+                || sampled.sampledAtMillis == 0 || SystemClock.elapsedRealtime() - sampled.sampledAtMillis
+                > MobileRuntimeSnapshot.LIVE_VIDEO_MAX_AGE_MILLIS) {
+            controlRuntime.failClosed("runtime_report_not_current");
+            return;
+        }
+        MobileRuntimeSnapshot snapshot = sampled.snapshot;
+        if (retry.recoverFatal(snapshot, () -> stopPipeline("native_full_recovery_required"),
+                SystemClock::elapsedRealtime)) {
+            publish(MobileRuntimePhase.FAILED, "接收或解码已终止，等待重试", retry.failureCode());
+            return;
+        }
+        boolean healthy=snapshot.videoLinkLive && snapshot.decoderReady
                 && snapshot.qnnReady && snapshot.qnnExecutionLive;
-        synchronized (controlRuntime) {
+        authorization.ifCurrent(sampledLifecycle, () -> { synchronized (controlRuntime) {
             // Serialize this final reopen check with onLost's immediate close.
             // The catalog may have changed while native reports were sampled.
-            if (!endpoint.hasSameDataPlaneRoute(transportCatalog.selected())) {
+            if (!foreground || destroying || !running || sampledPipeline != reportGeneration
+                    || activeEndpoint == null
+                    || !activeEndpoint.hasSameDataPlaneRoute(transportCatalog.selected())) {
                 controlRuntime.failClosed("local_route_changed_during_health");
                 return;
             }
-            controlRuntime.reconcile(healthy,snapshot.nativeControlOutputRequestedKnown,
+            reportCursor.consume(sampled, () -> controlRuntime.reconcile(healthy,snapshot.nativeControlOutputRequestedKnown,
                     snapshot.nativeControlOutputRequested,snapshot.nativeControlOutputEffective,
-                    snapshot.nativeControlOutputRecoverySuspended);
-        }
+                    snapshot.nativeControlOutputRecoverySuspended));
+        }});
         recordDiagnostics(snapshot);
+    }
+
+    private void requestReportSample(long lifecycle, long pipelineGeneration) {
+        if (!reportPending.compareAndSet(false, true)) return;
+        try {
+            reportWorker.execute(() -> {
+                boolean consumeQueued = false;
+                try {
+                    final long sampledAt = SystemClock.elapsedRealtime();
+                    MobileRuntimeSnapshot snapshot = MobileRuntimeSnapshot.from(
+                            QnnHtpBridge.getNativeVideoReceiverReport(), QnnHtpBridge.getNativeH264DecoderReport(),
+                            QnnHtpBridge.getNativeQnnRealtimeReport(), controlRuntime.makcuReport());
+                    boolean current = authorization.ifCurrent(lifecycle, () -> MobileRuntimeReportStore.publish(
+                            pipelineGeneration, lifecycle, sampledAt, snapshot));
+                    // Consume the completed sample promptly, without another
+                    // sampling request or a backlog on the lifecycle worker.
+                    if (current) {
+                        consumeQueued = true;
+                        submit(() -> {
+                            try { consumeCurrentSample(); }
+                            finally { reportPending.set(false); }
+                        });
+                    }
+                } catch (RuntimeException | LinkageError failure) {
+                    events.write("runtime_report_unavailable", MobileThrowableDiagnostics.format(failure));
+                } finally {
+                    // Do not sample another pre-enable native snapshot while
+                    // this result still awaits its serialized gate decision.
+                    if (!consumeQueued) reportPending.set(false);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException stopped) { reportPending.set(false); }
     }
 
     private void recordDiagnostics(MobileRuntimeSnapshot snapshot) {
@@ -288,19 +371,21 @@ public final class MobileRuntimeService extends Service {
     };
     private void startPipeline(MobileTransportEndpoint endpoint) {
         final long topology=topologyRevision.get();
-        nextAttempt=SystemClock.elapsedRealtime()+5000;
+        final long lifecycle = authorization.generation();
         publish(MobileRuntimePhase.STARTING,"正在加载本地模型");
         MobileModelCatalog.Profile model=controlRuntime.activeModel();
         MobilePipelineCoordinator.PrepareResult prepared=prepareModelDataPlaneClosed(
                 getApplicationInfo().nativeLibraryDir,lastSkeletonDirectory,model,
-                MobileInferenceBackendPolicy.evaluate(currentSocCompatibility()));
+                MobileInferenceBackendPolicy.evaluate(currentSocCompatibility(), true,
+                        hasPackagedPortableModel(model)));
         if(!prepared.prepared) { stopPipeline("model_prepare_failed");
-            publish(MobileRuntimePhase.FAILED,prepared.message); return; }
+            retry.failed(SystemClock.elapsedRealtime(), prepared.disposition, prepared.failureCode);
+            publish(MobileRuntimePhase.FAILED,prepared.message,prepared.failureCode); return; }
         // Activity may have stopped while the native model was loading.
         // Android emits capability/link callbacks for the same usable route
         // while QNN loads. Callback count alone must not cancel and reload the
         // graph forever. Re-read OS route state before opening the data plane.
-        if(destroying || !foreground
+        if(destroying || !foreground || !authorization.current(lifecycle)
                 || !endpoint.hasSameDataPlaneRoute(transportCatalog.selected()) ||
                 (topology!=topologyRevision.get() && !routeStillAvailable(endpoint))) {
             stopPipeline("start_cancelled"); return;
@@ -308,15 +393,32 @@ public final class MobileRuntimeService extends Service {
         controlRuntime.selectModel(model);
         MobilePipelineCoordinator.StartResult started=pipeline.openPreparedDataPlane(endpoint,model);
         if(!started.started) { stopPipeline("udp_start_failed");
-            publish(MobileRuntimePhase.FAILED,started.message); return; }
-        if (destroying || !foreground
+            retry.failed(SystemClock.elapsedRealtime(), started.disposition, started.failureCode);
+            publish(MobileRuntimePhase.FAILED,started.message,retry.failureCode()); return; }
+        if (destroying || !foreground || !authorization.current(lifecycle)
                 || !endpoint.hasSameDataPlaneRoute(transportCatalog.selected())) {
             stopPipeline("start_cancelled"); return;
         }
         activeEndpoint=endpoint; running=true;
+        retry.reset();
+        reportGeneration = MobileRuntimeReportStore.begin();
         acquireLocks();
         publish(MobileRuntimePhase.RUNNING,"本地直连运行："+endpoint.localIpv4+" ↔ "+endpoint.hostIpv4);
         events.write("local_pipeline_started",endpoint.detail());
+    }
+    private boolean hasPackagedPortableModel(MobileModelCatalog.Profile model) {
+        if (model == null) return false;
+        try {
+            String[] names = getAssets().list("portable_models");
+            if (names != null) for (String name : names)
+                if (name.equals(model.portableModelAsset)) return true;
+            return false;
+        } catch (java.io.IOException unavailable) {
+            events.write("portable_package_capability_unavailable", unavailable.toString());
+            // An I/O failure is different from a successfully enumerated
+            // package with no portable model; let the Service back off.
+            throw new java.io.UncheckedIOException(unavailable);
+        }
     }
     private boolean routeStillAvailable(MobileTransportEndpoint endpoint) {
         if (endpoint == null || connectivity == null) return false;
@@ -338,19 +440,26 @@ public final class MobileRuntimeService extends Service {
                 + " foreground=" + foreground + " endpoint={"
                 + (activeEndpoint == null ? "none" : activeEndpoint.detail()) + "}");
         running=false; activeEndpoint=null;
+        reportGeneration = MobileRuntimeReportStore.begin();
         if(controlRuntime!=null) controlRuntime.failClosed(reason);
         try { if(pipeline!=null) pipeline.stop(); }
         finally { releaseLocks(); }
-        publish(MobileRuntimePhase.READY,"本地模式：等待连接或返回应用");
+        if (retry.terminal()) publish(MobileRuntimePhase.FAILED,
+                "模型或包能力不可用：" + retry.failureCode(), retry.failureCode());
+        else publish(MobileRuntimePhase.READY,"本地模式：等待连接或返回应用");
     }
     private void failed(Throwable e) {
         try { stopPipeline("local_runtime_failure"); } catch(RuntimeException|LinkageError ignored) {}
-        nextAttempt=SystemClock.elapsedRealtime()+5000;
+        retry.failed(SystemClock.elapsedRealtime(), MobilePipelineCoordinator.FailureDisposition.RETRYABLE,
+                "transient_runtime_failure");
         events.write("local_runtime_failed",MobileThrowableDiagnostics.format(e));
-        publish(MobileRuntimePhase.FAILED,e.getClass().getSimpleName()+": "+e.getMessage());
+        publish(MobileRuntimePhase.FAILED,e.getClass().getSimpleName()+": "+e.getMessage(),retry.failureCode());
     }
     private void publish(MobileRuntimePhase phase,String detail) {
-        composition.publish(new MobileRuntimeReadModel(phase,detail,++revision));
+        publish(phase,detail,"none");
+    }
+    private void publish(MobileRuntimePhase phase,String detail,String code) {
+        composition.publish(new MobileRuntimeReadModel(phase,detail,code,++revision));
     }
     private void acquireLocks() {
         if(wakeLock==null) {
@@ -376,9 +485,12 @@ public final class MobileRuntimeService extends Service {
                 .setContentIntent(open).setOngoing(true).addAction(0,"停止",stop).build();
     }
     @Override public void onDestroy() {
-        destroying=true; foreground=false;
+        authorization.destroy(() -> {
+            destroying=true; foreground=false;
+            if(controlRuntime!=null) controlRuntime.failClosed("service_destroyed");
+        });
         if(healthTask!=null) healthTask.cancel(false);
-        if(controlRuntime!=null) controlRuntime.failClosed("service_destroyed");
+        reportWorker.shutdownNow();
         if(connectivity!=null) {
             if(networkCallback!=null) connectivity.unregisterNetworkCallback(networkCallback);
             if(ethernetDemand!=null) connectivity.unregisterNetworkCallback(ethernetDemand);

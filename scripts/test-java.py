@@ -22,6 +22,9 @@ QnnAssetBundleInstaller QnnHtpCompatibilityPolicy'''.split()
 names.extend(["MobilePipelineCoordinator","Cat6MouseButtonProtocol","AsyncDiagnosticLog","AsyncBluetoothMoveSink","MobileResponseCalibration","ControlTransportTiming"])
 names=[name+'SelfTest' for name in names]
 names.extend(['MoveDeliveryTraceSelfTest','DiagnosticTraceBatchSelfTest'])
+names.append('MobileRuntimeRecoverySelfTest')
+names.append('TransportLifecycleSelfTest')
+names.append('MobileCalibrationPersistencePolicySelfTest')
 runner=out/'LocalBehaviorTests.java'
 runner.write_text('''package com.visionforge.inferencebenchmark;
 public final class LocalBehaviorTests {

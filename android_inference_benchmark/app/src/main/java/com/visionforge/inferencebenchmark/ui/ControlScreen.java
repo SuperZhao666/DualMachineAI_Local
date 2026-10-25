@@ -13,6 +13,7 @@ import android.widget.TextView;
 import com.visionforge.inferencebenchmark.ControlTrigger;
 import com.visionforge.inferencebenchmark.MobileAimTarget;
 import com.visionforge.inferencebenchmark.MobileModelCatalog;
+import com.visionforge.inferencebenchmark.MobileControlTuning;
 import com.visionforge.inferencebenchmark.R;
 
 import java.util.ArrayList;
@@ -294,9 +295,12 @@ final class ControlScreen implements MobileScreen {
     }
 
     private void addSliders(LinearLayout page) {
-        gainSlider = new SliderBinding(R.string.control_gain, 0.01f, 2.00f, 199,
+        gainSlider = new SliderBinding(R.string.control_gain,
+                MobileControlTuning.MINIMUM_GAIN, MobileControlTuning.MAXIMUM_GAIN, 94,
                 value -> String.format(Locale.US, "%.2f", value), actions::onSetControlGain);
         page.addView(gainSlider.root);
+        page.addView(VisionForgeTheme.text(context,
+                context.getString(R.string.control_gain_detail), 12, VisionForgeTheme.TEXT_MUTED));
         deadzoneSlider = new SliderBinding(R.string.control_deadzone, 0.0f, 64.0f, 128,
                 value -> String.format(Locale.US, "%.1f px", value), actions::onSetControlDeadzone);
         page.addView(deadzoneSlider.root, VisionForgeTheme.match(context, 8));
@@ -311,6 +315,8 @@ final class ControlScreen implements MobileScreen {
                         Math.round(value)),
                 value -> actions.onSetSwitchConfirmationMillis(Math.round(value)));
         page.addView(switchConfirmationSlider.root, VisionForgeTheme.match(context, 8));
+        page.addView(VisionForgeTheme.text(context,
+                context.getString(R.string.control_switch_confirmation_detail), 12, VisionForgeTheme.TEXT_MUTED));
         maximumLimitDetail = VisionForgeTheme.text(context,
                 context.getString(R.string.control_effective_limits_pending), 12,
                 VisionForgeTheme.TEXT_MUTED);
