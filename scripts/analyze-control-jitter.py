@@ -11,12 +11,13 @@ p.add_argument('trace', type=Path)
 p.add_argument('--output', required=True, type=Path)
 args = p.parse_args()
 with args.trace.open(encoding='utf-8-sig', newline='') as handle:
-    rows = [{k: v if k == 'trace_id' else float(v) for k, v in row.items()}
-            for row in csv.DictReader(handle)]
-for row in rows:
+    raw_rows = list(csv.DictReader(handle))
+for row in raw_rows:
     # Validate supplied dimensions even if this row has no reversal to classify.
     center(row, 'x')
     center(row, 'y')
+rows = [{k: v if k == 'trace_id' else float(v) for k, v in row.items()}
+        for row in raw_rows]
 
 def active(row):
     return bool(int(row['flags']) & 1) and not int(row['flags']) & (2 | 16)

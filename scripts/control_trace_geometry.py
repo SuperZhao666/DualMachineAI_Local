@@ -5,7 +5,7 @@ import math
 def axis_dimension(row, axis):
     name = 'width' if axis == 'x' else 'height'
     for key in ('coordinate_' + name, 'model_' + name):
-        if key in row and row[key] not in (None, ''):
+        if key in row:
             try:
                 value = float(row[key])
             except (ValueError, TypeError) as error:

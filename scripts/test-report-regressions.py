@@ -77,7 +77,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(report['locks_after_250ms'][0]['error_p50'], 0)
 
     def test_invalid_supplied_dimension_is_rejected(self):
-        for dimension in (0, -1, 'nan', 'inf'):
+        for dimension in (0, -1, 'nan', 'inf', '', None):
             for script in ('analyze-control-dynamics.py', 'analyze-control-jitter.py'):
                 rows = self.rows(accepted=1)
                 rows[0]['coordinate_width'] = dimension
