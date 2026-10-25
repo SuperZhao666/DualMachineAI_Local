@@ -17,7 +17,8 @@ geometry={'detection_width':a.detection_width,'detection_height':a.detection_hei
 metadata=a.output/'geometry.json'
 if metadata.exists() and json.loads(metadata.read_text(encoding='utf-8'))!=geometry:
     p.error('Archive geometry already exists and differs; use a separate output directory')
-if (a.output/'bursts.json').exists():p.error('Archive already contains bursts; refusing to overwrite recorded evidence')
+if (a.output/'bursts.json').exists() or any(a.output.glob('detections-*.csv')):
+    p.error('Archive already contains complete or partial bursts; refusing to overwrite recorded evidence')
 metadata.write_text(json.dumps(geometry,indent=2),encoding='utf-8')
 adb = ['adb', '-s', a.device]
 intent = adb + ['shell', 'am', 'start', '-n',

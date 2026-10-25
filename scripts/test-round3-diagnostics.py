@@ -188,5 +188,17 @@ class CliTests(unittest.TestCase):
         result,report=self.dynamics([dict(r,stream_generation=1)for r in rows]+[dict(r,stream_generation=2)for r in rows])
         self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(len(report['coverage']),2)
 
+    def test_collector_preserves_interrupted_archive_before_any_adb(self):
+        for recorded in ('bursts.json','detections-00.csv'):
+            with self.subTest(recorded=recorded),tempfile.TemporaryDirectory() as value:
+                directory=Path(value); evidence=directory/recorded
+                evidence.write_bytes(b'original interrupted evidence')
+                result=self.invoke('collect-detection-bursts.py',['--device','fixture-not-a-real-device',
+                    '--output',directory,'--detection-width',640,'--detection-height',640])
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('refusing to overwrite recorded evidence',result.stderr)
+                self.assertEqual(evidence.read_bytes(),b'original interrupted evidence')
+                self.assertFalse((directory/'geometry.json').exists())
+
 
 if __name__=='__main__':unittest.main(verbosity=2)
