@@ -73,7 +73,7 @@ final class ProjectionProbeSession {
     // Exact production JNI configuration only. No preferences, runtime owner,
     // transport controller, USB permission, Bluetooth or hardware discovery.
     private static boolean configure(boolean requested) {
-        return QnnHtpBridge.configureNativeMakcuControl(1.01f,.5f,127,45,requested,
+        return QnnHtpBridge.configureNativeMakcuControl(.95f,.5f,127,45,requested,
                 false,0L,1f,1f,1f,480f,.42f,.75f,.20f,1f,2,24f,new float[0],
                 "ow_m_640",0,-1,0,false,true,.18f);
     }

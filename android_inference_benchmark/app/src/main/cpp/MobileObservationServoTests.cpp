@@ -501,8 +501,32 @@ void test_first_lock_after_empty_frames_uses_the_frame_clock() {
     const auto& trace=core.control_trace();
     const auto& sample=trace.samples[(trace.count-1)%trace.samples.size()];
     assert(std::abs(sample.servo.dt_seconds-float(interval)/1e6F)<.000001F);
-    const float gain=1.F-std::pow(1.F-config(true).motion.response_gain,float(std::min(interval,std::uint64_t{25'000}))*60.F/1e6F);
-    assert(out.delta_x==int(std::lround(gain*40.F)));
+  }
+}
+void test_first_lock_final_output_respects_near_and_far_pacing() {
+  for (const std::uint64_t interval : {5'000U,16'667U,25'000U,33'333U}) {
+    for (const float error : {40.F,100.F}) {
+      MobileControlCore core(config(true));
+      assert(core.restore_response_calibration(1,1,24'000,.99F,.99F));
+      (void)core.process({}, {1,100'000,123'000});
+      (void)core.process({}, {2,100'000+interval,123'000+interval});
+      const auto at=100'000+2*interval;
+      const std::array target{box(208.F+error,208.F)};
+      const auto out=core.process(target,{3,at,at+23'000});
+      // The near target shares 128 trusted counts across at least 80 ms:
+      // 16,5,4,3 reports respectively, hence 8,25,32,42 counts. Far initial
+      // acquisition is exempt only while fewer than two reports are pending.
+      const int near_cap=interval==5'000U?8:interval==16'667U?25:interval==25'000U?32:42;
+      const float gain=1.F-std::pow(1.F-config(true).motion.response_gain,
+          float(std::min(interval,std::uint64_t{25'000}))*60.F/1e6F);
+      const int planner=std::min(64,
+          int(std::lround(gain*error)));
+      const int expected=error==40.F?std::min(planner,near_cap):planner;
+      if(out.delta_x!=expected)std::fprintf(stderr,"pacing interval=%llu error=%.0f actual=%d expected=%d planner=%d\n",
+          interval,error,out.delta_x,expected,planner);
+      assert(out.delta_x==expected);
+      assert(std::abs(out.delta_x)<=128);
+    }
   }
 }
 void test_low_fps_pixel_ownership_reaches_the_tracker() {
@@ -756,6 +780,7 @@ int main(int argc, char** argv) {
   test_missing_ticks_restart_delay_stability_without_rejecting_low_fps();
   test_trusted_packet_cap_preserves_near_and_pending_limits();
   test_first_lock_after_empty_frames_uses_the_frame_clock();
+  test_first_lock_final_output_respects_near_and_far_pacing();
   test_low_fps_complex_motion_keeps_identity_and_bounded_error();
   test_100ms_shape_occlusion_retains_the_measured_baseline();
   test_production_severe_dropout_retains_shipping_baseline();

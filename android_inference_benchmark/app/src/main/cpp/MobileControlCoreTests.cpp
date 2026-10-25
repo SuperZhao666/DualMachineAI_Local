@@ -1465,8 +1465,10 @@ void test_pid_limit_anti_windup_residual_and_settle_guard() {
   assert(core.process(far_right, frame(2, 20'000)).delta_x == 12);
   const std::array far_left{box(100.0F, 100.0F, 20.0F, 20.0F, 0.90F, 1U)};
   const auto reversed = core.process(far_left, frame(3, 30'000));
-  assert(reversed.delta_x == -12);
-  assert(reversed.suppression_reason == ControlSuppressionReason::none);
+  // A one-frame discontinuity retains identity without treating the old
+  // right-hand geometry as a fresh command. A consistent next sample resumes.
+  assert(reversed.held && !reversed.has_move());
+  assert(reversed.suppression_reason == ControlSuppressionReason::lock_held);
   assert(core.process(far_left, frame(4, 40'000)).delta_x == -12);
 
   MobileControlConfig residual_config = algorithm_test_config();

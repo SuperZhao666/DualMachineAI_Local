@@ -47,7 +47,11 @@ void keeps_person_after_confirmed_pixel_correspondences(){
 void unsupported_correspondence_never_releases_a_lock(){
   for(unsigned mode=0;mode<8;++mode){
     MobileControlCore core(config());const std::array first{box(300)};
-    const auto old=core.process(first,frame(1));const std::array second{box(236)},third{box(230)};
+    const auto old=core.process(first,frame(1));auto second_box=box(236),third_box=box(230);
+    // Isolate unsupported pixel evidence from the explicitly authorized
+    // >=.75 unique-stranger fast switch, which does not require pixel rebind.
+    second_box.confidence=third_box.confidence=.70F;
+    const std::array second{second_box},third{third_box};
     auto a=hint(100'000,-64),b=hint(112'000,-6);
     if(mode==0)a.support=3;
     if(mode==1)a.quality=.85F;
@@ -78,7 +82,9 @@ void known_neighbour_and_current_owner_are_not_overridden(){
   assert(!out.held&&out.lock_id==owner.lock_id&&out.target_x==240&&core.metrics().image_identity_rebinds==0);
 }
 void no_image_keeps_original_wait(){
-  MobileControlCore core(config());const std::array first{box(300)},second{box(236)},third{box(230)};
+  MobileControlCore core(config());auto second_box=box(236),third_box=box(230);
+  second_box.confidence=third_box.confidence=.70F;
+  const std::array first{box(300)},second{second_box},third{third_box};
   const auto old=core.process(first,frame(1));assert(core.process(second,frame(2)).held);
   const auto out=core.process(third,frame(3));assert(out.held&&!out.has_move()&&out.lock_id==old.lock_id);
 }

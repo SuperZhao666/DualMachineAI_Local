@@ -10,6 +10,7 @@
 #include "MobileDisturbanceVelocity.hpp"
 #include "DisturbanceSelectionTrace.hpp"
 #include "MobileTargetTracker.hpp"
+#include "CoVisibleTrackHistory.hpp"
 #include "YoloPostprocessor.hpp"
 #include "vfdual/model_contract.hpp"
 
@@ -282,6 +283,7 @@ struct MobileControlOutput {
   bool has_target{};
   bool held{};
   bool switched{};
+  bool position_provisional{};
   AimSource source{AimSource::none};
   ControlSuppressionReason suppression_reason{ControlSuppressionReason::none};
   float target_x{};
@@ -453,6 +455,9 @@ class MobileControlCore final {
     std::uint64_t observation_track_id{};
     bool has_body_pair{};
     bool track_was_known{};
+    // Allocation frontier is used only to conservatively identify a stranger,
+    // never to claim that an older track was co-visible with this owner.
+    bool stranger_eligible{};
     // True only while the selected head geometry is synthesized from the
     // exact paired-body track during a temporary real-head dropout.
     bool head_from_body_projection{};
@@ -501,13 +506,14 @@ class MobileControlCore final {
       const Candidate& left, const Candidate& right) noexcept;
   [[nodiscard]] bool track_id_rebind_admissible(
       const Candidate& candidate, bool* giou_only) const noexcept;
-  [[nodiscard]] bool match_locked(Candidate& result) noexcept;
+  [[nodiscard]] bool match_locked(Candidate& result, std::uint64_t observed_at_us) noexcept;
   [[nodiscard]] bool update_pending_switch(
       const Candidate& challenger, std::uint64_t observed_at_us) noexcept;
   // A missing owner must not keep suppressing the one strong person already
   // in view. Known co-visible neighbours stay on the retention timer.
   [[nodiscard]] bool visible_replacement_ready(Candidate& result) const noexcept;
   void remember_candidate_tracks();
+  void update_known_track_presence(std::uint64_t observed_at_us) noexcept;
   void accept_candidate(const Candidate& candidate, const ControlFrameContext& frame, bool switched) noexcept;
   void accept_same_identity_head_upgrade(
       const Candidate& candidate,
@@ -518,8 +524,9 @@ class MobileControlCore final {
   [[nodiscard]] bool refresh_locked_candidate(
       const ControlFrameContext& frame) noexcept;
   [[nodiscard]] MobileControlOutput held_output(ControlSuppressionReason reason) const noexcept;
+  [[nodiscard]] MobileControlOutput provisional_output(const ControlFrameContext& frame) noexcept;
   [[nodiscard]] MobileControlOutput active_output(
-      const ControlFrameContext& frame, bool switched) noexcept;
+      const ControlFrameContext& frame, bool switched, const Candidate* provisional = nullptr) noexcept;
   [[nodiscard]] static ControlSuppressionReason control_suppression_reason(
       MotionPlannerSuppressionReason reason) noexcept;
   [[nodiscard]] ControlSuppressionReason accept_frame_context(
@@ -550,6 +557,7 @@ class MobileControlCore final {
   std::uint64_t quiet_background_since_us_{};
   std::uint64_t feedback_frame_interval_us_{};
   bool background_valid_this_frame_{};
+  bool stationary_x_evidence_{},stationary_y_evidence_{};
   bool retinal_velocity_constrained_x_{},retinal_velocity_constrained_y_{};
   // Trace bit 128: group correspondence aligned identities, not camera evidence.
   bool association_shift_this_frame_{};
@@ -570,12 +578,11 @@ class MobileControlCore final {
   std::vector<PairOption> pair_options_{};
   std::vector<std::size_t> paired_body_for_head_{};
   std::vector<std::uint8_t> paired_bodies_{};
-  // Tracker ids are positive and monotonically increasing until reset.  One
-  // ceiling therefore represents the complete current-lock identity history
-  // without a growing hash set or per-track hot-path allocation.
-  std::uint64_t known_track_id_ceiling_{};
+  CoVisibleTrackHistory<> known_neighbours_{};
+  std::uint64_t seen_track_frontier_{},owner_seen_frontier_{};
   Candidate locked_candidate_{};
   Candidate pending_candidate_{};
+  Candidate provisional_candidate_{};
   float velocity_x_{};
   float velocity_y_{};
   bool has_lock_{};

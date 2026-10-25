@@ -84,6 +84,7 @@ void report_move_discarded_before_send(std::uint64_t ticket) noexcept;
 [[nodiscard]] std::string makcu_move_bridge_trace();
 void set_control_calibration_scope(const std::string& scope);
 [[nodiscard]] bool restore_control_calibration(float x, float y, std::uint64_t delay, float qx, float qy);
-[[nodiscard]] std::array<double,7> control_calibration_snapshot();
+// Prefix 0..6 is retained; 7..10 carry delay identifiability and its risk range.
+[[nodiscard]] std::array<double,11> control_calibration_snapshot();
 
 }  // namespace vfdual_android

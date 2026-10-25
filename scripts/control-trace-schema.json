@@ -124,7 +124,8 @@
     "8": "reacquisition requires confirmation",
     "16": "known neighbour extends identity hold",
     "32": "ranked alternative is previously known",
-    "4096": "current same-owner geometry uncertainty interval; accepted geometry/time and derivatives are not refreshed"
+    "4096": "current same-owner geometry uncertainty interval; accepted geometry/time and derivatives are not refreshed",
+    "8192": "co-visible identity history is incomplete; unproven rebind and early replacement are withheld"
   },
   "velocity_flags": {
     "1": "camera-compensated proposal evaluated",

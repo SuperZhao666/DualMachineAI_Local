@@ -7,7 +7,7 @@ if(WIN32)
     # The repository root is intentionally descriptive and therefore deep.
     # Hash long object-path prefixes so Ninja can create every generated
     # directory on Windows without changing the source layout.
-    set(CMAKE_OBJECT_PATH_MAX 128 CACHE STRING
+    set(CMAKE_OBJECT_PATH_MAX 240 CACHE STRING
         "Maximum object path length for Windows native builds")
 endif()
 
@@ -30,6 +30,7 @@ set(VFDUAL_VERSION_PATCH "${CMAKE_MATCH_3}")
 set(VFDUAL_WINDOWS_FILE_VERSION "${VFDUAL_RELEASE_VERSION}.0")
 
 project(VisionForgeDualMachine VERSION "${VFDUAL_RELEASE_VERSION}" LANGUAGES CXX)
+enable_testing()
 
 # Build entry points verify the real /c /showIncludes channel and project
 # header dependency edges; /EP can emit a different encoding on Windows.
@@ -220,6 +221,11 @@ if(WIN32)
         --require-complete
     )
     set_tests_properties(vfdual_dataset_evaluator_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME vfdual_dataset_evaluator_input_tests
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/host/windows/tests/dataset_evaluator_input_tests.py"
+            "$<TARGET_FILE:VisionForgeDatasetEvaluate>")
 
     add_executable(VisionForgeControlTraceEvaluate
         host/windows/src/mobile_control_trace_evaluator.cpp
@@ -267,138 +273,106 @@ if(WIN32)
             -DVFDUAL_CONTROL_TRACE_CASE=high_fps_reacquisition
             -P "${vfdual_control_trace_contract_script}")
 
-    add_executable(vfdual_mobile_background_motion_tests
+endif()
+
+# Standard C++ control/policy contracts run on every desktop platform. Keep
+# platform-specific Host/driver executables in their own WIN32 blocks.
+function(vfdual_add_portable_test name)
+    set(vfdual_normalized_sources)
+    foreach(vfdual_source IN LISTS ARGN)
+        get_filename_component(vfdual_absolute_source "${vfdual_source}" REALPATH
+            BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        list(APPEND vfdual_normalized_sources "${vfdual_absolute_source}")
+    endforeach()
+    add_executable(${name} ${vfdual_normalized_sources})
+    target_include_directories(${name} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shared/include")
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+    vfdual_add_portable_test(vfdual_mobile_background_motion_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileBackgroundMotionTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileBackgroundMotion.cpp)
-    target_include_directories(vfdual_mobile_background_motion_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_background_motion_tests COMMAND vfdual_mobile_background_motion_tests)
 
-    add_executable(vfdual_mobile_target_image_motion_tests
+    vfdual_add_portable_test(vfdual_mobile_target_image_motion_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetImageMotionTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetImageMotion.cpp)
-    target_include_directories(vfdual_mobile_target_image_motion_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_target_image_motion_tests COMMAND vfdual_mobile_target_image_motion_tests)
 
-    add_executable(vfdual_qnn_execution_profile_tests
+    vfdual_add_portable_test(vfdual_qnn_execution_profile_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/QnnExecutionProfileTests.cpp)
     target_include_directories(vfdual_qnn_execution_profile_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/qnn/include/QNN)
-    add_test(NAME vfdual_qnn_execution_profile_tests COMMAND vfdual_qnn_execution_profile_tests)
+        "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/qnn/include/QNN")
 
-    add_executable(vfdual_pipeline_timing_trace_tests
+    vfdual_add_portable_test(vfdual_pipeline_timing_trace_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/PipelineTimingTraceTests.cpp)
-    add_test(NAME vfdual_pipeline_timing_trace_tests COMMAND vfdual_pipeline_timing_trace_tests)
 
-    add_executable(vfdual_decoded_observation_admission_tests
+    vfdual_add_portable_test(vfdual_decoded_observation_admission_tests
         ../android_inference_benchmark/app/src/main/cpp/DecodedObservationAdmissionTests.cpp)
-    add_test(NAME vfdual_decoded_observation_admission_tests
-        COMMAND vfdual_decoded_observation_admission_tests)
 
-    add_executable(vfdual_control_observation_domain_tests
+    vfdual_add_portable_test(vfdual_control_observation_domain_tests
         ../android_inference_benchmark/app/src/main/cpp/ControlObservationDomainTests.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileBackgroundMotion.cpp)
-    target_include_directories(vfdual_control_observation_domain_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp shared/include)
-    add_test(NAME vfdual_control_observation_domain_tests
-        COMMAND vfdual_control_observation_domain_tests)
 
-    add_executable(vfdual_mobile_pixel_patch_search_reuse_tests
+    vfdual_add_portable_test(vfdual_mobile_pixel_patch_search_reuse_tests
         ../android_inference_benchmark/app/src/main/cpp/MobilePixelPatchSearchReuseTests.cpp)
-    add_test(NAME vfdual_mobile_pixel_patch_search_reuse_tests
-        COMMAND vfdual_mobile_pixel_patch_search_reuse_tests)
 
-    add_executable(vfdual_mobile_image_history_tests
+    vfdual_add_portable_test(vfdual_mobile_image_history_tests
         ../android_inference_benchmark/app/src/main/cpp/MobileImageHistoryTests.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileBackgroundMotion.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileTargetImageMotion.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_image_history_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp shared/include)
-    add_test(NAME vfdual_mobile_image_history_tests
-        COMMAND vfdual_mobile_image_history_tests)
 
-    add_executable(vfdual_mobile_patch_sad_tests
+    vfdual_add_portable_test(vfdual_mobile_patch_sad_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobilePatchSadTests.cpp)
-    add_test(NAME vfdual_mobile_patch_sad_tests COMMAND vfdual_mobile_patch_sad_tests)
 
-    add_executable(vfdual_mobile_rgb_area_prefilter_tests
+    vfdual_add_portable_test(vfdual_mobile_rgb_area_prefilter_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileRgbAreaPrefilterTests.cpp)
-    add_test(NAME vfdual_mobile_rgb_area_prefilter_tests COMMAND vfdual_mobile_rgb_area_prefilter_tests)
 
-    add_executable(vfdual_mobile_pixel_patch_tests
+    vfdual_add_portable_test(vfdual_mobile_pixel_patch_tests
         ../android_inference_benchmark/app/src/main/cpp/MobilePixelPatchTests.cpp)
-    target_include_directories(vfdual_mobile_pixel_patch_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_pixel_patch_tests COMMAND vfdual_mobile_pixel_patch_tests)
 
-    add_executable(vfdual_mobile_fresh_pixel_projection_tests
+    vfdual_add_portable_test(vfdual_mobile_fresh_pixel_projection_tests
         ../android_inference_benchmark/app/src/main/cpp/MobileFreshPixelProjectionTests.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileFreshPixelProjection.cpp)
-    target_include_directories(vfdual_mobile_fresh_pixel_projection_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_fresh_pixel_projection_tests COMMAND vfdual_mobile_fresh_pixel_projection_tests)
 
-    add_executable(vfdual_projection_observation_gate_tests
+    vfdual_add_portable_test(vfdual_projection_observation_gate_tests
         ../android_inference_benchmark/app/src/main/cpp/ProjectionObservationGateTests.cpp)
-    add_test(NAME vfdual_projection_observation_gate_tests COMMAND vfdual_projection_observation_gate_tests)
 
-    add_executable(vfdual_projection_timing_trace_tests
+    vfdual_add_portable_test(vfdual_projection_timing_trace_tests
         ../android_inference_benchmark/app/src/main/cpp/ProjectionTimingTraceTests.cpp)
-    add_test(NAME vfdual_projection_timing_trace_tests COMMAND vfdual_projection_timing_trace_tests)
 
-    add_executable(vfdual_disturbance_selection_trace_tests
+    vfdual_add_portable_test(vfdual_disturbance_selection_trace_tests
         ../android_inference_benchmark/app/src/main/cpp/DisturbanceSelectionTraceTests.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_disturbance_selection_trace_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp
-        shared/include)
-    add_test(NAME vfdual_disturbance_selection_trace_tests COMMAND vfdual_disturbance_selection_trace_tests)
 
-    add_executable(vfdual_native_decoder_report_snapshot_tests
+    vfdual_add_portable_test(vfdual_native_decoder_report_snapshot_tests
         ../android_inference_benchmark/app/src/main/cpp/NativeDecoderReportSnapshotTests.cpp)
-    target_include_directories(vfdual_native_decoder_report_snapshot_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp
-        shared/include)
-    add_test(NAME vfdual_native_decoder_report_snapshot_tests COMMAND vfdual_native_decoder_report_snapshot_tests)
 
-    add_executable(vfdual_mobile_image_identity_tests
+    vfdual_add_portable_test(vfdual_mobile_image_identity_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileImageIdentityTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_image_identity_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_image_identity_tests COMMAND vfdual_mobile_image_identity_tests)
 
-    add_executable(vfdual_mobile_image_association_tests
+    vfdual_add_portable_test(vfdual_mobile_image_association_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileImageAssociationTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetImageMotion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_image_association_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_image_association_tests COMMAND vfdual_mobile_image_association_tests)
 
-    add_executable(vfdual_mobile_target_tracker_tests
+    vfdual_add_portable_test(vfdual_mobile_target_tracker_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTrackerTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp
     )
-    target_include_directories(vfdual_mobile_target_tracker_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_target_tracker_tests COMMAND vfdual_mobile_target_tracker_tests)
 
     add_executable(VisionForgeCrowdCorrespondenceAudit
         tools/crowd_correspondence_audit.cpp
@@ -406,46 +380,30 @@ if(WIN32)
     target_include_directories(VisionForgeCrowdCorrespondenceAudit PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
 
-    add_executable(vfdual_mobile_large_motion_tests
+    vfdual_add_portable_test(vfdual_mobile_large_motion_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileLargeMotionTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileBackgroundMotion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_large_motion_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_large_motion_tests COMMAND vfdual_mobile_large_motion_tests)
 
-    add_executable(vfdual_mobile_acquisition_latency_tests
+    vfdual_add_portable_test(vfdual_mobile_acquisition_latency_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileAcquisitionLatencyTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_acquisition_latency_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_acquisition_latency_tests COMMAND vfdual_mobile_acquisition_latency_tests)
 
-    add_executable(vfdual_mobile_observation_servo_tests
+    vfdual_add_portable_test(vfdual_mobile_observation_servo_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileObservationServoTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_observation_servo_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_observation_servo_tests COMMAND vfdual_mobile_observation_servo_tests)
 
-    add_executable(vfdual_mobile_control_audit_tests
+    vfdual_add_portable_test(vfdual_mobile_control_audit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlAuditTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_control_audit_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_control_audit_tests COMMAND vfdual_mobile_control_audit_tests)
 
     add_executable(VisionForgeGameMotionDiagnostics
         tools/game_motion_diagnostics.cpp
@@ -457,27 +415,17 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
     add_test(NAME vfdual_game_projection_geometry_tests COMMAND VisionForgeGameMotionDiagnostics --geometry-only)
 
-    add_executable(vfdual_mobile_control_core_tests
+    vfdual_add_portable_test(vfdual_mobile_control_core_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCoreTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp
     )
-    target_include_directories(vfdual_mobile_control_core_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_control_core_tests COMMAND vfdual_mobile_control_core_tests)
 
-    add_executable(vfdual_inference_deadline_admission_tests
+    vfdual_add_portable_test(vfdual_inference_deadline_admission_tests
         ../android_inference_benchmark/app/src/main/cpp/InferenceDeadlineAdmissionTests.cpp)
-    target_include_directories(vfdual_inference_deadline_admission_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_inference_deadline_admission_tests COMMAND vfdual_inference_deadline_admission_tests)
-    add_executable(vfdual_atomic_duration_summary_tests
+    vfdual_add_portable_test(vfdual_atomic_duration_summary_tests
         ../android_inference_benchmark/app/src/main/cpp/AtomicDurationSummaryTests.cpp)
-    target_include_directories(vfdual_atomic_duration_summary_tests PRIVATE
-        ../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_atomic_duration_summary_tests COMMAND vfdual_atomic_duration_summary_tests)
 
     # The bridge's ticket/session interaction needs the production translation
     # unit, not only independent gate tests. JDK headers provide the JNI types;
@@ -495,98 +443,56 @@ if(WIN32)
         add_test(NAME vfdual_makcu_bridge_deadline_tests COMMAND vfdual_makcu_bridge_deadline_tests)
     endif()
 
-    add_executable(vfdual_mobile_motion_planner_tests
+    vfdual_add_portable_test(vfdual_mobile_motion_planner_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlannerTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp)
-    target_include_directories(vfdual_mobile_motion_planner_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_mobile_motion_planner_tests COMMAND vfdual_mobile_motion_planner_tests)
 
-    add_executable(vfdual_mobile_control_allocation_tests
+    vfdual_add_portable_test(vfdual_mobile_control_allocation_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlAllocationTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
-    target_include_directories(vfdual_mobile_control_allocation_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_mobile_control_allocation_tests COMMAND vfdual_mobile_control_allocation_tests)
 
-    add_executable(vfdual_control_blocker_state_tests
+    vfdual_add_portable_test(vfdual_control_blocker_state_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ControlBlockerStateTests.cpp)
-    target_include_directories(vfdual_control_blocker_state_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_control_blocker_state_tests COMMAND vfdual_control_blocker_state_tests)
 
-    add_executable(vfdual_receiver_recovery_policy_tests
+    vfdual_add_portable_test(vfdual_receiver_recovery_policy_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverRecoveryPolicyTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverRecoveryPolicy.cpp
     )
-    target_include_directories(vfdual_receiver_recovery_policy_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_receiver_recovery_policy_tests COMMAND vfdual_receiver_recovery_policy_tests)
 
-    add_executable(vfdual_receiver_repeat_resync_policy_tests
+    vfdual_add_portable_test(vfdual_receiver_repeat_resync_policy_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverRepeatResyncPolicyTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverRecoveryPolicy.cpp
     )
-    target_include_directories(vfdual_receiver_repeat_resync_policy_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_receiver_repeat_resync_policy_tests
-        COMMAND vfdual_receiver_repeat_resync_policy_tests)
 
-    add_executable(vfdual_receiver_reference_sync_policy_tests
+    vfdual_add_portable_test(vfdual_receiver_reference_sync_policy_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverReferenceSyncPolicyTests.cpp
     )
-    target_include_directories(vfdual_receiver_reference_sync_policy_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_receiver_reference_sync_policy_tests
-        COMMAND vfdual_receiver_reference_sync_policy_tests)
 
-    add_executable(vfdual_receiver_idle_backoff_tests
+    vfdual_add_portable_test(vfdual_receiver_idle_backoff_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverIdleBackoffTests.cpp
     )
-    target_include_directories(vfdual_receiver_idle_backoff_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_receiver_idle_backoff_tests COMMAND vfdual_receiver_idle_backoff_tests)
 
-    add_executable(vfdual_receiver_source_session_tests
+    vfdual_add_portable_test(vfdual_receiver_source_session_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverSourceSessionTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/ReceiverSourceSession.cpp
     )
-    target_include_directories(vfdual_receiver_source_session_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
     target_link_libraries(vfdual_receiver_source_session_tests PRIVATE vfdual_protocol)
-    add_test(NAME vfdual_receiver_source_session_tests COMMAND vfdual_receiver_source_session_tests)
 
-    add_executable(vfdual_makcu_output_gate_tests
+    vfdual_add_portable_test(vfdual_makcu_output_gate_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/MakcuOutputGateTests.cpp
     )
-    target_include_directories(vfdual_makcu_output_gate_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_makcu_output_gate_tests COMMAND vfdual_makcu_output_gate_tests)
 
-    add_executable(vfdual_yolo_postprocessor_tests
+    vfdual_add_portable_test(vfdual_yolo_postprocessor_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/YoloPostprocessorTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/YoloPostprocessor.cpp
     )
-    target_include_directories(vfdual_yolo_postprocessor_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/shared/include)
-    add_test(NAME vfdual_yolo_postprocessor_tests COMMAND vfdual_yolo_postprocessor_tests)
 
-    add_executable(vfdual_decoder_input_drop_metrics_tests
+    vfdual_add_portable_test(vfdual_decoder_input_drop_metrics_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/DecoderInputDropMetricsTests.cpp
     )
-    target_include_directories(vfdual_decoder_input_drop_metrics_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp)
-    add_test(NAME vfdual_decoder_input_drop_metrics_tests
-        COMMAND vfdual_decoder_input_drop_metrics_tests)
 
-endif()
-
-enable_testing()
 add_executable(vfdual_protocol_tests tests/protocol_tests.cpp)
 target_link_libraries(vfdual_protocol_tests PRIVATE vfdual_protocol)
 add_test(NAME vfdual_protocol_tests COMMAND vfdual_protocol_tests)
@@ -601,6 +507,29 @@ set_tests_properties(vfdual_native_nv12_parity_tests PROPERTIES SKIP_RETURN_CODE
 add_executable(vfdual_reassembly_recovery_tests tests/reassembly_recovery_tests.cpp)
 target_link_libraries(vfdual_reassembly_recovery_tests PRIVATE vfdual_protocol)
 add_test(NAME vfdual_reassembly_recovery_tests COMMAND vfdual_reassembly_recovery_tests)
+
+vfdual_add_portable_test(vfdual_fixed_metric_ring_tests
+    ../android_inference_benchmark/app/src/main/cpp/FixedMetricRingTests.cpp)
+vfdual_add_portable_test(vfdual_co_visible_track_history_tests
+    ../android_inference_benchmark/app/src/main/cpp/CoVisibleTrackHistoryTests.cpp)
+vfdual_add_portable_test(vfdual_inference_generation_policy_tests
+    ../android_inference_benchmark/app/src/main/cpp/InferenceGenerationPolicyTests.cpp)
+vfdual_add_portable_test(vfdual_portable_inference_failure_policy_tests
+    ../android_inference_benchmark/app/src/main/cpp/PortableInferenceFailurePolicyTests.cpp)
+vfdual_add_portable_test(vfdual_datagram_receive_result_tests
+    ../android_inference_benchmark/app/src/main/cpp/DatagramReceiveResultTests.cpp)
+vfdual_add_portable_test(vfdual_mobile_audit_regression_tests
+    ../android_inference_benchmark/app/src/main/cpp/MobileAuditRegressionTests.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
+vfdual_add_portable_test(vfdual_mobile_quantization_terminal_tests
+    ../android_inference_benchmark/app/src/main/cpp/MobileQuantizationTerminalTests.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileControlCore.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileMotionPlanner.cpp
+    ../android_inference_benchmark/app/src/main/cpp/MobileTargetTracker.cpp)
+vfdual_add_portable_test(vfdual_mobile_response_identification_tests
+    ../android_inference_benchmark/app/src/main/cpp/MobileResponseIdentificationTests.cpp)
 
 if(WIN32)
     add_executable(vfdual_dxgi_capture_tests
@@ -860,6 +789,10 @@ if(WIN32)
     add_test(NAME vfdual_udp_socket_tests COMMAND vfdual_udp_socket_tests)
 endif()
 
+vfdual_add_portable_test(vfdual_host_operation_ownership_tests
+    host/windows/tests/host_operation_ownership_tests.cpp)
+target_include_directories(vfdual_host_operation_ownership_tests PRIVATE host/windows/include)
+
 if(WIN32)
     add_executable(VisionForgeRawMouseProbe tools/raw_mouse_probe_main.cpp)
     target_link_libraries(VisionForgeRawMouseProbe PRIVATE user32)
@@ -869,6 +802,35 @@ endif()
 # configurations define NDEBUG globally, so undefine it for test executables
 # only; otherwise CTest can report a false pass without evaluating a check.
 get_property(vfdual_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+
+# Fail configuration when a new mobile native test has no build entry. The
+# one desktop JNI translation unit requires Windows JNI headers; ARM pixel
+# kernels already have their separate explicit runtime skip contract.
+set(vfdual_registered_test_sources)
+foreach(vfdual_target IN LISTS vfdual_directory_targets)
+    get_target_property(vfdual_sources ${vfdual_target} SOURCES)
+    foreach(vfdual_source IN LISTS vfdual_sources)
+        get_filename_component(vfdual_source_absolute "${vfdual_source}" REALPATH
+            BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        list(APPEND vfdual_registered_test_sources "${vfdual_source_absolute}")
+    endforeach()
+endforeach()
+file(GLOB vfdual_mobile_test_sources CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../android_inference_benchmark/app/src/main/cpp/*Tests.cpp")
+foreach(vfdual_test_source IN LISTS vfdual_mobile_test_sources)
+    get_filename_component(vfdual_test_absolute "${vfdual_test_source}" REALPATH)
+    list(FIND vfdual_registered_test_sources "${vfdual_test_absolute}" vfdual_registration)
+    if(vfdual_registration EQUAL -1)
+        get_filename_component(vfdual_test_name "${vfdual_test_source}" NAME)
+        if(vfdual_test_name STREQUAL "MakcuBridgeDeadlineTests.cpp" AND
+                NOT TARGET vfdual_makcu_bridge_deadline_tests)
+            message(STATUS "Explicit test exclusion: ${vfdual_test_name} requires Windows JNI headers")
+        else()
+            message(FATAL_ERROR "Native test lacks a target or explicit exclusion: ${vfdual_test_source}")
+        endif()
+    endif()
+endforeach()
+
 set(vfdual_test_build_targets)
 foreach(vfdual_target IN LISTS vfdual_directory_targets)
     if(vfdual_target MATCHES "_tests$")

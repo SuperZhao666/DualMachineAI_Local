@@ -19,6 +19,8 @@ class MobileContinuousServo final {
  public:
   struct AxisDiagnostic {
     float lead{}, feedback{}, feedforward{}, desired{}, residual{};
+    float resolution_radius{};
+    bool resolution_stopped{};
   };
   struct Diagnostic {
     float dt_seconds{}, horizon_seconds{};
@@ -80,6 +82,7 @@ class MobileContinuousServo final {
     output.phase = std::hypot(in.error_x, in.error_y) < 3.0F ? MobileMotionPhase::settle : MobileMotionPhase::pursuit;
     const auto axis = [&](float raw_error, float velocity, float response,
                           float pending, bool trusted, float minimum_error, float maximum_error,
+                          bool stationary_evidence,
                           Axis& state, float& predicted, bool& pursuit_boosted, AxisDiagnostic& diagnostic) {
       const float bounded_velocity = std::clamp(velocity, -config.maximum_target_velocity_pixels_per_second,
                                                          config.maximum_target_velocity_pixels_per_second);
@@ -103,7 +106,40 @@ class MobileContinuousServo final {
       const float feedforward = trusted ? bounded_velocity * dt : 0.0F;
       diagnostic.lead = lead;
       diagnostic.feedforward = feedforward;
-      if (feedback == 0.0F && std::abs(feedforward) < .01F) { state = {}; return 0; }
+      // A zero velocity can also mean unavailable evidence. Only an explicit
+      // current observation may start this confirmation clock. Pending reports
+      // may postpone entry, but do not erase evidence of a stationary target.
+      const bool stationary = stationary_evidence && trusted && bounded_velocity == 0.0F;
+      const bool interrupted = previous_us_ && (!continuous_previous ||
+          (measured_cadence && previous_interval > observation_interval_us));
+      if (!stationary || interrupted) {
+        state.stationary_since_us = 0;
+        state.resolution_stopped = false;
+      } else if (!state.stationary_since_us) {
+        state.stationary_since_us = in.observed_at_us;
+      }
+      const bool confirmed_stationary = stationary && state.stationary_since_us &&
+          in.observed_at_us - state.stationary_since_us >= 2U * visibility_us;
+      // An integer count cannot improve an error inside half a calibrated
+      // count. This is a conditional physical resolution limit, not a global
+      // deadzone or a latch that suppresses moving-target feedforward.
+      const float radius = std::max(config.deadzone_pixels, .5F * response);
+      diagnostic.resolution_radius = radius;
+      const float numerical_hysteresis = std::max(.0001F, radius * .00001F);
+      if (!confirmed_stationary || !in.no_pending_reports ||
+          std::abs(raw_error) > radius + (state.resolution_stopped ? numerical_hysteresis : 0.F)) {
+        state.resolution_stopped = false;
+      } else {
+        state.resolution_stopped = true;
+        state.residual = state.previous_error = 0.F;
+        diagnostic.resolution_stopped = true;
+        output.settle_stopped = true;
+        return 0;
+      }
+      if (feedback == 0.0F && std::abs(feedforward) < .01F) {
+        state.residual = state.previous_error = 0.F;
+        return 0;
+      }
       if (state.previous_error * predicted < 0.0F) state.residual = 0.0F;
       // Increase position feedback only when the measured relative velocity
       // carries the target farther from the reticle. Retain the base response
@@ -137,11 +173,13 @@ class MobileContinuousServo final {
     };
     output.delta_x = axis(in.error_x, in.target_velocity_x_pixels_per_second,
         config.response_x_px_per_count, pending_x, trusted_x,
-        in.prediction_min_error_x, in.prediction_max_error_x, x_, output.predicted_error_x,
+        in.prediction_min_error_x, in.prediction_max_error_x, in.stationary_x_evidence,
+        x_, output.predicted_error_x,
         output.pursuit_boosted_x, diagnostic_.x);
     output.delta_y = axis(in.error_y, in.target_velocity_y_pixels_per_second,
         config.response_y_px_per_count, pending_y, trusted_y,
-        in.prediction_min_error_y, in.prediction_max_error_y, y_, output.predicted_error_y,
+        in.prediction_min_error_y, in.prediction_max_error_y, in.stationary_y_evidence,
+        y_, output.predicted_error_y,
         output.pursuit_boosted_y, diagnostic_.y);
     if (!output.has_move()) output.suppression_reason =
         std::hypot(output.predicted_error_x, output.predicted_error_y) <= config.deadzone_pixels
@@ -155,7 +193,11 @@ class MobileContinuousServo final {
   [[nodiscard]] const MobileMotionPlannerOutput& last_output() const noexcept { return last_; }
   [[nodiscard]] const Diagnostic& diagnostic() const noexcept { return diagnostic_; }
  private:
-  struct Axis { float residual{}, previous_error{}; };
+  struct Axis {
+    float residual{}, previous_error{};
+    std::uint64_t stationary_since_us{};
+    bool resolution_stopped{};
+  };
   Axis x_{}, y_{};
   std::uint64_t target_{}, previous_us_{};
   std::uint64_t previous_visibility_us_{}, delay_stable_since_us_{};
