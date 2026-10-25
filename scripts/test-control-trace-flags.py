@@ -30,16 +30,16 @@ for code in (38,39):
     require(s['large_background_motion_recovered_frames']==0,'old projected head is never background')
     require(s['configured_geometric_head_frames']==0,'old aliased model token is not geometric')
 
-for code in (49,50,56,59,60,61,62):
+for code in (49,50,56,59,60,61,62,65,66,67):
     s=summary([manifest('body',code),profile('body')],[row('body',1|8|16384),row('body',1)])
     require(s['actionable_head_sources']=={'measured':0,'projected':0},'large background is not head marker')
     require(s['large_background_motion_recovered_frames']==1,'background bit retained')
     require(s['configured_geometric_head_frames']==2,'explicit preceding body-head profile retained')
     require(s['raw_bit_counts']['all_rows']=={'16384':1,'32768':0},'raw bit count preserved')
     if code==50:require(s['trace_layouts'][0]['evidence_level']=='reviewed_release_range','range provenance labelled')
-    if code in (60,61,62):require(s['trace_layouts'][0]['evidence_level']=='direct_retained_source','current producer is verified explicitly')
+    if code in (60,61,62,65,66,67):require(s['trace_layouts'][0]['evidence_level']=='direct_retained_source','current producer is verified explicitly')
 
-for events in ([],[manifest('unknown',63)],[manifest('unknown','bad')],
+for events in ([],[manifest('unknown',63)],[manifest('unknown',64)],[manifest('unknown',999)],[manifest('unknown','bad')],
                [manifest('unknown',39),manifest('unknown',60)]):
     s=summary(events,[row('unknown',1|16384)])
     require(s['actionable_head_sources']=={'measured':None,'projected':None},'unknown semantics is null, not zero')

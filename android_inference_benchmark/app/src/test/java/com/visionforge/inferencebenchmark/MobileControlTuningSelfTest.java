@@ -8,6 +8,25 @@ final class MobileControlTuningSelfTest {
         verifiesOverwatchUsesFastTightPresets();
         verifiesMissingModelUsesOverwatchDefaults();
         verifiesOnlyExactLegacyOverwatchValuesMigrate();
+        verifiesEffectiveGainContract();
+    }
+
+    private static void verifiesEffectiveGainContract() {
+        float previous = 0;
+        for (int step = 1; step <= 95; ++step) {
+            float gain = step / 100.0f;
+            require(MobileControlTuning.effectiveGain(gain) == gain);
+            require(gain > previous);
+            previous = gain;
+        }
+        for (float old : new float[] {0.95f, 1.0f, 1.01f, 1.5f, 2.0f}) {
+            require(MobileControlTuning.effectiveGain(old) == 0.95f);
+            // The old formula already clamped this entire interval to .95.
+            require(Math.pow(1-Math.min(old,.95f),.48) ==
+                    Math.pow(1-MobileControlTuning.effectiveGain(old),.48));
+        }
+        require(MobileControlTuning.effectiveGain(Float.NaN) == .60f);
+        require(MobileControlTuning.effectiveGain(Float.POSITIVE_INFINITY) == .60f);
     }
 
     private static void verifiesOverwatchUsesFastTightPresets() {

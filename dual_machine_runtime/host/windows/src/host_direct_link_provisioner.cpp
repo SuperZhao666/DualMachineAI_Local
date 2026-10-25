@@ -1680,13 +1680,15 @@ bool snapshot_dns_matches(const HostDirectLinkChangeSnapshot& snapshot) {
 bool snapshot_configuration_matches(const HostDirectLinkChangeSnapshot& snapshot) {
     const auto adapters = enumerate_network_profiles();
     const HostNetworkAdapterProfile* adapter = find_snapshot_adapter(snapshot, adapters);
-    if (adapter == nullptr || adapter->has_default_gateway ||
-        host_direct_link_has_any_isolated_address(*adapter)) {
+    if (adapter == nullptr || !host_direct_link_restored_address_matches(
+            *adapter, snapshot.adapter_id,
+            snapshot.address_mode == OriginalAddressMode::dhcp)) {
         return false;
     }
     if (snapshot.owned_address_backend ==
         RestoreAddressBackendHint::transient_ip_helper) {
-        return snapshot_interface_policy_matches(snapshot, adapter->interface_index);
+        return snapshot_dns_matches(snapshot) &&
+            snapshot_interface_policy_matches(snapshot, adapter->interface_index);
     }
     const bool address_matches = snapshot.address_mode == OriginalAddressMode::dhcp
         ? adapter->dhcp_enabled
@@ -2051,20 +2053,6 @@ bool is_configurable_direct_link_candidate(
         !has_unclassified_usable_ipv4(adapter);
 }
 
-bool is_routed_dhcp_direct_link_candidate(
-    const HostNetworkAdapterProfile& adapter) noexcept {
-    if (!is_operational_physical_ethernet(adapter) ||
-        !adapter.has_default_gateway ||
-        host_direct_link_has_any_isolated_address(adapter) ||
-        has_owned_subnet_address_conflict(adapter)) {
-        return false;
-    }
-    if (!adapter.dhcp_enabled || !adapter.has_usable_ipv4) return false;
-    if (has_preexisting_static_usable_ipv4(adapter)) return false;
-    return has_dhcp_assigned_usable_ipv4(adapter) &&
-        !has_unclassified_usable_ipv4(adapter);
-}
-
 std::vector<std::string_view> rejection_predicates(
     const HostNetworkAdapterProfile& adapter) {
     std::vector<std::string_view> predicates;
@@ -2073,12 +2061,10 @@ std::vector<std::string_view> rejection_predicates(
     if (adapter.transport != HostAdapterTransport::ethernet) {
         predicates.emplace_back("transport_not_ethernet");
     }
-    if (adapter.has_default_gateway &&
-        !is_routed_dhcp_direct_link_candidate(adapter)) {
+    if (adapter.has_default_gateway) {
         predicates.emplace_back("has_default_gateway");
     }
-    if (!is_base_direct_link_candidate(adapter) &&
-        !is_routed_dhcp_direct_link_candidate(adapter)) {
+    if (!is_base_direct_link_candidate(adapter)) {
         return predicates;
     }
     if (adapter.has_isolated_private_ipv4) return predicates;
@@ -2158,8 +2144,7 @@ std::string describe_adapter_inventory(
                 ? "ready_pending"
             : (is_configurable_direct_link_candidate(adapter)
                 ? "configurable"
-                : (is_routed_dhcp_direct_link_candidate(adapter)
-                    ? "configurable_routed_dhcp" : "rejected")));
+                : "rejected"));
         detail << "] selection=" << selection_state << " rejected_by=[";
         for (std::size_t predicate_index = 0;
              predicate_index < rejected.size(); ++predicate_index) {
@@ -2200,18 +2185,24 @@ bool host_direct_link_has_any_isolated_address(
         });
 }
 
+bool host_direct_link_restored_address_matches(
+    const HostNetworkAdapterProfile& adapter, const std::string& snapshot_adapter_id,
+    bool originally_dhcp) noexcept {
+    if (adapter.adapter_id != snapshot_adapter_id || !adapter.hardware_interface ||
+        adapter.transport != HostAdapterTransport::ethernet ||
+        host_direct_link_has_any_isolated_address(adapter)) return false;
+    if (originally_dhcp) return adapter.dhcp_enabled;
+    return !adapter.has_default_gateway && adapter.has_ics_private_ipv4;
+}
+
 HostDirectLinkPlan choose_host_direct_link_plan(
     const std::vector<HostNetworkAdapterProfile>& adapters) {
     HostDirectLinkPlan plan{};
     std::vector<std::size_t> ready_adapters;
     std::vector<std::size_t> configurable_adapters;
-    std::vector<std::size_t> routed_dhcp_adapters;
     for (std::size_t index = 0; index < adapters.size(); ++index) {
         const auto& adapter = adapters[index];
         if (!is_base_direct_link_candidate(adapter)) {
-            if (is_routed_dhcp_direct_link_candidate(adapter)) {
-                routed_dhcp_adapters.push_back(index);
-            }
             continue;
         }
         if (host_direct_link_has_any_isolated_address(adapter)) {
@@ -2238,21 +2229,9 @@ HostDirectLinkPlan choose_host_direct_link_plan(
             "multiple_existing_cat6_adapters", adapters, ready_adapters);
         return plan;
     }
-    if (configurable_adapters.empty() && routed_dhcp_adapters.empty()) {
+    if (configurable_adapters.empty()) {
         plan.reason = "reason=no_unnumbered_wired_adapter " +
             describe_adapter_inventory(adapters);
-        return plan;
-    }
-    if (configurable_adapters.empty()) {
-        if (routed_dhcp_adapters.size() > 1U) {
-            plan.ambiguous_downstream = true;
-            plan.reason = describe_ambiguous_adapters(
-                "ambiguous_routed_dhcp_ethernet_adapters",
-                adapters, routed_dhcp_adapters);
-            return plan;
-        }
-        plan.downstream_adapter = routed_dhcp_adapters.front();
-        plan.reason = "isolated_routed_dhcp_wired_adapter_selected";
         return plan;
     }
     if (configurable_adapters.size() > 1U) {
@@ -2622,8 +2601,7 @@ HostDirectLinkRestorationResult restore_host_direct_link_ipv4() {
     const auto adapters = enumerate_network_profiles();
     const HostNetworkAdapterProfile* downstream = find_snapshot_adapter(snapshot, adapters);
     if (downstream == nullptr || !downstream->hardware_interface ||
-        downstream->transport != HostAdapterTransport::ethernet ||
-        downstream->has_default_gateway) {
+        downstream->transport != HostAdapterTransport::ethernet) {
         outcome.status = HostDirectLinkRestoreStatus::unsafe_snapshot;
         outcome.detail = "snapshot_adapter_identity_or_route_mismatch";
         return outcome;
@@ -2636,6 +2614,13 @@ HostDirectLinkRestorationResult restore_host_direct_link_ipv4() {
         }
         outcome.status = HostDirectLinkRestoreStatus::restored;
         outcome.detail = "stale_snapshot_removed_configuration_already_restored";
+        return outcome;
+    }
+    // Observing an already restored DHCP route is safe; mutating a routed
+    // adapter whose complete snapshot does not match is a separate decision.
+    if (downstream->has_default_gateway) {
+        outcome.status = HostDirectLinkRestoreStatus::unsafe_snapshot;
+        outcome.detail = "snapshot_routed_configuration_not_fully_restored";
         return outcome;
     }
     if (!process_is_elevated()) {

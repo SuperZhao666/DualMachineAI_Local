@@ -3,23 +3,30 @@ import argparse, csv, json
 from collections import Counter
 from pathlib import Path
 import numpy as np
+from control_trace_geometry import center
 
 p = argparse.ArgumentParser()
 p.add_argument('trace', type=Path)
 p.add_argument('--output', type=Path, required=True)
 args = p.parse_args()
 rows = list(csv.DictReader(args.trace.open(encoding='utf-8')))
+if not rows:
+    p.error('trace contains no observation rows')
+centers = np.array([[center(r, 'x'), center(r, 'y')] for r in rows], dtype=float)
 a = {k: np.array([float(r[k]) for r in rows]) for k in rows[0] if k != 'trace_id'}
 at = a['observed_us']; dt = np.diff(at, prepend=at[0]); n = len(at)
 valid = ((a['flags'].astype(int) & 8) != 0) & (dt > 0) & (dt < 20000)
 cmd = {int(r['accepted_at_us']): (int(r['accepted_dx']), int(r['accepted_dy']))
        for r in rows if int(r['accepted_at_us'])}
-cmd_at = np.array(sorted(cmd)); cmd_xy = np.array([cmd[t] for t in cmd_at])
+cmd_at = np.array(sorted(cmd), dtype=np.int64)
+cmd_xy = np.array([cmd[t] for t in cmd_at], dtype=float).reshape(-1, 2)
 cmd_sum = np.vstack([np.zeros(2), cmd_xy.cumsum(axis=0)])
 bad_sum = np.r_[0, (~valid).cumsum()]
 bg_sum = np.vstack([np.zeros(2), np.column_stack([a['background_x'], a['background_y']]).cumsum(axis=0)])
 
 def fit(begin, end, axis):
+    if not len(cmd_at):
+        return []
     fits = []
     for span in [2, 4, 8]:
         last = np.arange(max(span, begin + span), end, span)
@@ -58,7 +65,8 @@ for end in range(1,n+1):
     if end < n and a['lock_id'][end] == a['lock_id'][start]: continue
     active = (a['flags'][start:end].astype(int) & 3) == 1
     active &= at[start:end] - at[start] >= 250000
-    err = np.hypot(a['target_x'][start:end]-208, a['target_y'][start:end]-208)[active]
+    err = np.hypot(a['target_x'][start:end]-centers[start:end, 0],
+                   a['target_y'][start:end]-centers[start:end, 1])[active]
     if len(err):
         locks.append({'lock_id':int(a['lock_id'][start]), 'start_s':round((at[start]-at[0])/1e6,3),
                       'duration_ms':round((at[end-1]-at[start])/1e3,2), 'frames':int(active.sum()),

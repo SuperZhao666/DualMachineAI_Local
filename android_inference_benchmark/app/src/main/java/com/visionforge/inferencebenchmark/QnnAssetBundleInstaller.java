@@ -143,7 +143,7 @@ final class QnnAssetBundleInstaller {
                     size += read;
                 }
             }
-            if (size <= 0L) throw new IOException("Packaged QNN asset is empty: " + name);
+            if (size <= 0L) throw new MobilePackagedAssetException("Packaged QNN asset is empty: " + name);
             descriptors.add(new AssetDescriptor(name, size, toHex(digest.digest())));
         }
         return descriptors;
@@ -173,7 +173,7 @@ final class QnnAssetBundleInstaller {
         }
         if (copied != descriptor.size || !descriptor.sha256.equals(toHex(digest.digest()))) {
             deleteQuietly(temporary);
-            throw new IOException("Packaged QNN asset changed while copying: " + descriptor.name);
+            throw new MobilePackagedAssetException("Packaged QNN asset changed while copying: " + descriptor.name);
         }
         moveAtomically(temporary, destination);
     }

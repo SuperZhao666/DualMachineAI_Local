@@ -648,9 +648,12 @@ void StreamerDesktopApp::shutdown_background_runtime() noexcept {
     background_shutdown_done_ = true;
     cancel_mobile_refresh_probe();
     ++startup_generation_;
+    startup_operation_stop_source_.request_stop();
     runtime_service_.request_stop();
-    runtime_service_.stop();
     safe_join_thread(startup_thread_);
+    // start() owns the service's worker slot until its caller returns.
+    // Let that cancelled startup finish before joining the runtime worker here.
+    runtime_service_.stop();
     isolated_dhcp_server_.stop();
     runtime_service_.restore_direct_link_on_clean_shutdown();
 }
@@ -884,11 +887,14 @@ LRESULT StreamerDesktopApp::handle_message(HWND window, UINT message, WPARAM w_p
         case kMobileRefreshCompletedMessage: {
             const std::unique_ptr<MobileRefreshResult> result(reinterpret_cast<MobileRefreshResult*>(l_param));
             if (result == nullptr) return 0;
-            const bool generation_matches = result->generation == mobile_refresh_generation_;
+            // A stale queued result must not join/reset a newer worker or UI.
+            if (!mobile_refresh_operation_.owns(result->generation)) return 0;
+            const bool cancelled = mobile_refresh_operation_.cancelled();
             safe_join_thread(mobile_refresh_thread_);
+            mobile_refresh_operation_.finish(result->generation);
             mark_mobile_refresh_idle();
             EnableWindow(refresh_mobile_button_, TRUE);
-            if (!generation_matches) {
+            if (cancelled) {
                 if (start_after_mobile_refresh_cancel_) {
                     start_after_mobile_refresh_cancel_ = false;
                     append_event(L"空闲端点检测已取消：继续正式启动传输");
@@ -918,8 +924,11 @@ LRESULT StreamerDesktopApp::handle_message(HWND window, UINT message, WPARAM w_p
         case kStartupCompletedMessage: {
             const std::unique_ptr<StartupResult> result(reinterpret_cast<StartupResult*>(l_param));
             if (result == nullptr) return 0;
+            if (result->generation != startup_worker_generation_) return 0;
             if (result->generation != startup_generation_) {
                 safe_join_thread(startup_thread_);
+                runtime_service_.stop();
+                runtime_service_.restore_direct_link_on_clean_shutdown();
                 starting_ = false;
                 set_ui_phase(HostUiPhase::idle);
                 clear_runtime_metrics();
@@ -1488,7 +1497,7 @@ void StreamerDesktopApp::refresh_mobile_device() {
     SetWindowTextW(route_network_latency_text_, L"-- ms");
     set_status(L"正在检查手机端点；此操作不会开始捕获或传输。");
     append_event(L"已开始按 CAT6 优先顺序检测手机端点");
-    const std::uint64_t generation = ++mobile_refresh_generation_;
+    const std::uint64_t generation = mobile_refresh_operation_.begin();
     const std::stop_token stop_token = mobile_refresh_stop_source_.get_token();
     try {
         mobile_refresh_thread_ = std::thread([
@@ -1538,7 +1547,7 @@ void StreamerDesktopApp::cancel_mobile_refresh_probe() noexcept {
         return;
     }
     start_after_mobile_refresh_cancel_ = false;
-    ++mobile_refresh_generation_;
+    mobile_refresh_operation_.invalidate();
     mobile_refresh_stop_source_.request_stop();
     safe_join_thread(mobile_refresh_thread_);
     mark_mobile_refresh_idle();
@@ -1611,6 +1620,7 @@ bool StreamerDesktopApp::reap_completed_mobile_refresh_thread(const char* contex
     log_host_runtime_event("host_gui_mobile_refresh_state_repaired", detail.str());
 
     if (completed_joinable_thread) safe_join_thread(mobile_refresh_thread_);
+    mobile_refresh_operation_.invalidate();
     mark_mobile_refresh_idle();
     return true;
 }
@@ -1652,7 +1662,7 @@ void StreamerDesktopApp::start_streamer(HWND window) {
     }
     if (mobile_refresh_thread_.joinable() || mobile_refresh_state_ == MobileRefreshState::running) {
         start_after_mobile_refresh_cancel_ = true;
-        ++mobile_refresh_generation_;
+        mobile_refresh_operation_.cancel();
         mobile_refresh_stop_source_.request_stop();
         update_action_state(false, true);
         EnableWindow(refresh_mobile_button_, FALSE);
@@ -1763,6 +1773,10 @@ void StreamerDesktopApp::start_streamer(HWND window) {
         std::string{"startup_joinable="} + (startup_thread_.joinable() ? "1" : "0"));
     safe_join_thread(startup_thread_);
     log_host_runtime_event("host_gui_startup_thread_joined");
+    mobile_refresh_operation_.invalidate();
+    start_after_mobile_refresh_cancel_ = false;
+    startup_operation_stop_source_ = std::stop_source{};
+    const std::stop_token operation_stop_token = startup_operation_stop_source_.get_token();
     starting_ = true;
     last_event_frame_ = 0U;
     last_recovery_count_ = 0U;
@@ -1770,15 +1784,21 @@ void StreamerDesktopApp::start_streamer(HWND window) {
     last_transport_.clear();
     last_runtime_display_id_ = settings.display_id;
     const std::uint64_t generation = ++startup_generation_;
+    startup_worker_generation_ = generation;
     try {
         log_host_runtime_event(
             "host_gui_startup_thread_launching",
             "generation=" + std::to_string(generation));
-        startup_thread_ = std::thread([this, settings, generation, window] {
+        startup_thread_ = std::thread([this, settings, generation, window, operation_stop_token] {
             std::string error;
             bool started = false;
             try {
-                started = runtime_service_.start(settings, error);
+                started = runtime_service_.start(settings, error, operation_stop_token);
+                if (operation_stop_token.stop_requested()) {
+                    runtime_service_.stop();
+                    started = false;
+                    error = kHostStartupCancelledError;
+                }
             } catch (const std::exception& exception) {
                 error = describe_background_exception(
                     "Host runtime start", exception);
@@ -1830,7 +1850,7 @@ void StreamerDesktopApp::stop_streamer() {
     const bool had_active_runtime = starting_ || was_running_ || runtime_service_.is_running();
     if (start_after_mobile_refresh_cancel_) {
         start_after_mobile_refresh_cancel_ = false;
-        ++mobile_refresh_generation_;
+        mobile_refresh_operation_.cancel();
         mobile_refresh_stop_source_.request_stop();
         update_action_state(false, false);
         set_status(L"已取消等待中的正式启动。");
@@ -1839,6 +1859,7 @@ void StreamerDesktopApp::stop_streamer() {
     }
     if (starting_) {
         ++startup_generation_;
+        startup_operation_stop_source_.request_stop();
         runtime_service_.request_stop();
         EnableWindow(stop_button_, FALSE);
         set_status(L"\u6b63\u5728\u53d6\u6d88\u4f20\u8f93\u94fe\u8def\u542f\u52a8\u7b49\u5f85...");
@@ -1846,6 +1867,7 @@ void StreamerDesktopApp::stop_streamer() {
         return;
     }
     ++startup_generation_;
+    startup_operation_stop_source_.request_stop();
     runtime_service_.stop();
     runtime_service_.restore_direct_link_on_clean_shutdown();
     safe_join_thread(startup_thread_);

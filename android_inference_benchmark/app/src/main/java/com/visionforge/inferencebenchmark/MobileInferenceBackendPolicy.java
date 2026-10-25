@@ -2,6 +2,7 @@ package com.visionforge.inferencebenchmark;
 
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.ArrayList;
 
 /**
  * Pure SoC-to-backend routing policy.
@@ -41,6 +42,17 @@ final class MobileInferenceBackendPolicy {
         }
     }
 
+    static Plan evaluate(MobileSocCompatibilityPolicy.Result compatibility,
+                         boolean packagedQnn, boolean packagedPortable) {
+        Plan requested = evaluate(compatibility);
+        ArrayList<MobileInferenceBackend> available = new ArrayList<>();
+        for (MobileInferenceBackend backend : requested.candidates) {
+            if (backend.requiresQnnRuntime ? packagedQnn : packagedPortable) available.add(backend);
+        }
+        return new Plan(requested.reason + "_package_capabilities", true,
+                available.toArray(new MobileInferenceBackend[0]));
+    }
+
     /** Keeps hot reload on the backend family proven for the active session. */
     static Plan resumeFrom(MobileInferenceBackend selected) {
         if (selected == null) {
@@ -70,8 +82,12 @@ final class MobileInferenceBackendPolicy {
         final MobileInferenceBackend[] candidates;
 
         Plan(String reason, MobileInferenceBackend... candidates) {
+            this(reason, false, candidates);
+        }
+
+        private Plan(String reason, boolean allowUnavailable, MobileInferenceBackend... candidates) {
             if (reason == null || reason.isBlank()
-                    || candidates == null || candidates.length == 0) {
+                    || candidates == null || (!allowUnavailable && candidates.length == 0)) {
                 throw new IllegalArgumentException("invalid inference backend plan");
             }
             for (int index = 0; index < candidates.length; index++) {

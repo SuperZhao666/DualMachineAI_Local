@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+from file_transaction import commit_files
 
 spec = importlib.util.spec_from_file_location(
     'routing', Path(__file__).with_name('configure-game-routing.py'))
@@ -104,10 +105,10 @@ def apply():
         assert routing.digest(HOME / rel) == digest, 'Configuration changed since preparation'
     assert routing.api('GET', '/proxies')['proxies']['Proxy']['now'] == state['residential_selection']
     backup = Path(state['backup'])
-    for source, rel in [('candidate-script.js', state['script_relative']),
-                        ('candidate.yaml', 'clash-verge.yaml'), ('candidate.yaml', 'clash-verge-check.yaml')]:
-        shutil.copy2(backup / source, HOME / rel)
-    try:
+    reload_attempted = False
+    def reload_and_verify():
+        nonlocal reload_attempted
+        reload_attempted = True
         routing.api('PUT', '/configs', {'path': str(HOME / 'clash-verge.yaml')})
         assert routing.api('GET', '/configs')['mode'] == 'rule'
         proxies = routing.api('GET', '/proxies')['proxies']
@@ -116,15 +117,17 @@ def apply():
         actual = routing.api('GET', '/rules')['rules']
         assert actual[-1]['type'] == 'Match' and actual[-1]['proxy'] == 'Proxy'
         assert sum(r.get('proxy') == routing.GROUP for r in actual) == 5
-    except Exception:
-        for rel in ('clash-verge.yaml', 'clash-verge-check.yaml', state['script_relative']):
-            shutil.copy2(backup / rel, HOME / rel)
-        routing.api('PUT', '/configs', {'path': str(HOME / 'clash-verge.yaml')})
-        raise
-    state['status'] = 'applied'
-    state['applied_at'] = datetime.datetime.now().isoformat()
-    state['game_node'] = proxies[routing.GROUP]['now']
-    save(state)
+        state['status'] = 'applied'
+        state['applied_at'] = datetime.datetime.now().isoformat()
+        state['game_node'] = proxies[routing.GROUP]['now']
+        save(state)
+    def reload_restored():
+        if reload_attempted:
+            routing.api('PUT', '/configs', {'path': str(HOME / 'clash-verge.yaml')})
+    commit_files([(HOME / rel, backup / source) for source, rel in
+                  [('candidate-script.js', state['script_relative']),
+                   ('candidate.yaml', 'clash-verge.yaml'), ('candidate.yaml', 'clash-verge-check.yaml')]],
+                 after_commit=reload_and_verify, after_rollback=reload_restored, callback_paths=[AUDIT])
     print(json.dumps({'status': state['status'], 'game_node': state['game_node'],
                       'residential_unchanged': True, 'existing_connections_closed': 0}, ensure_ascii=False))
 

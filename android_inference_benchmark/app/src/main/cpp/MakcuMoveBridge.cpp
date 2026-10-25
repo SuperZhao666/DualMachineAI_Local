@@ -20,7 +20,7 @@
 namespace vfdual_android {
 namespace {
 constexpr float kMinimumRelativeGain = 0.01F;
-constexpr float kMaximumRelativeGain = 2.00F;
+constexpr float kMaximumRelativeGain = 0.95F;
 constexpr float kMaximumDeadzonePixels = 64.0F;
 constexpr std::int32_t kMinimumAxisDelta = 1;
 constexpr std::int32_t kMaximumAxisDelta = 127;
@@ -1089,6 +1089,8 @@ std::string makcu_move_bridge_report() {
   ControlCoreMetrics control_metrics{};
   MobileResponseEstimator::Axis response_x{}, response_y{};
   std::uint64_t response_delay_us{}, response_estimate_updates{};
+  MobileResponseEstimator::DelayRange response_delay_range{};
+  MobileResponseEstimator::LearningState response_learning_state{};
   bool observation_servo{};
   MobileTargetTrackerMetrics tracker_metrics{};
   MobileMotionPlannerMetrics motion_metrics{};
@@ -1108,6 +1110,8 @@ std::string makcu_move_bridge_report() {
     response_y = g_control_core.response_estimator().y();
     response_delay_us = g_control_core.response_estimator().delay_us();
     response_estimate_updates = g_control_core.response_estimator().updates();
+    response_delay_range = g_control_core.response_estimator().delay_range();
+    response_learning_state = g_control_core.response_estimator().learning_state();
     observation_servo = g_control_core.observation_servo_enabled();
     tracker_metrics = g_control_core.tracker_metrics();
     motion_metrics = g_control_core.motion_metrics();
@@ -1213,7 +1217,14 @@ std::string makcu_move_bridge_report() {
         << " output_recovery_suspended=" << g_output_gate.recovery_suspended()
         << " output_enabled=" << g_output_gate.output_enabled()
         << " relative_gain=" << g_relative_gain.load()
+        << " relative_gain_contract=error_fraction_per_60hz"
+        << " relative_gain_min=" << kMinimumRelativeGain
+        << " relative_gain_max=" << kMaximumRelativeGain
         << " deadzone_pixels=" << g_deadzone_pixels.load()
+        << " servo_resolution_rule=confirmed_stationary_half_count"
+        << " servo_resolution_radius_x_px=" << std::max(motion_config.deadzone_pixels, .5F * response_x.response)
+        << " servo_resolution_radius_y_px=" << std::max(motion_config.deadzone_pixels, .5F * response_y.response)
+        << " last_motion_resolution_stopped=" << motion_snapshot.settle_stopped
         << " maximum_axis_delta=" << g_maximum_axis_delta.load()
         << " switch_confirmation_duration_us="
         << switch_confirmation_duration_us
@@ -1481,6 +1492,11 @@ std::string makcu_move_bridge_report() {
         << " response_y_estimate=" << response_y.response << " response_y_trusted=" << response_y.trusted
         << " response_y_fit_quality=" << response_y.quality
         << " response_visibility_estimate_us=" << response_delay_us
+        << " response_delay_min_us=" << response_delay_range.minimum_us
+        << " response_delay_max_us=" << response_delay_range.maximum_us
+        << " response_delay_candidate_count=" << response_delay_range.candidates
+        << " response_delay_identifiable=" << response_delay_range.identifiable
+        << " response_learning_state=" << static_cast<unsigned>(response_learning_state)
         << " response_estimate_updates=" << response_estimate_updates
         << " background_motion_frames=" << control_metrics.background_motion_frames
         << " background_motion_unavailable_frames=" << control_metrics.background_motion_unavailable_frames
@@ -1597,11 +1613,13 @@ bool restore_control_calibration(float x,float y,std::uint64_t delay,float qx,fl
   return true;
 }
 
-std::array<double,7> control_calibration_snapshot() {
+std::array<double,11> control_calibration_snapshot() {
   std::scoped_lock lock(g_control_mutex);
   const auto& r=g_control_core.response_estimator();
+  const auto& range = r.delay_range();
   return {r.x().response,r.y().response,double(r.delay_us()),r.x().quality,r.y().quality,
-      r.x().trusted && r.y().trusted ? 1.0 : 0.0,double(r.updates())};
+      r.x().trusted && r.y().trusted ? 1.0 : 0.0,double(r.updates()),
+      range.identifiable?1.0:0.0,double(range.minimum_us),double(range.maximum_us),double(range.candidates)};
 }
 
 }  // namespace vfdual_android

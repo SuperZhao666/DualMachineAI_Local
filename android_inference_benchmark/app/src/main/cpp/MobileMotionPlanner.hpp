@@ -130,6 +130,9 @@ struct MobileMotionPlannerInput {
   // Continuous tracking projects the target box to the same future time as
   // its anchor. Legacy/planner callers retain observation-time bounds.
   bool prediction_bounds_follow_target_motion{};
+  // Explicit current evidence, not an unknown velocity represented by zero.
+  bool stationary_x_evidence{}, stationary_y_evidence{};
+  bool no_pending_reports{};
 };
 
 struct MobileMotionPlannerOutput {

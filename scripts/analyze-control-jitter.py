@@ -4,14 +4,20 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from control_trace_geometry import center
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('trace', type=Path)
 p.add_argument('--output', required=True, type=Path)
 args = p.parse_args()
 with args.trace.open(encoding='utf-8-sig', newline='') as handle:
-    rows = [{k: v if k == 'trace_id' else float(v) for k, v in row.items()}
-            for row in csv.DictReader(handle)]
+    raw_rows = list(csv.DictReader(handle))
+for row in raw_rows:
+    # Validate supplied dimensions even if this row has no reversal to classify.
+    center(row, 'x')
+    center(row, 'y')
+rows = [{k: v if k == 'trace_id' else float(v) for k, v in row.items()}
+        for row in raw_rows]
 
 def active(row):
     return bool(int(row['flags']) & 1) and not int(row['flags']) & (2 | 16)
@@ -41,7 +47,8 @@ for axis, bit in [('x', 512), ('y', 1024)]:
     flips = [(a, b) for a, b in pairs if a[delta] * b[delta] < 0
              and min(abs(a[delta]), abs(b[delta])) >= 2]
     same_side = [(a, b) for a, b in flips
-                 if (a['target_' + axis] - 208) * (b['target_' + axis] - 208) > 0]
+                 if (a['target_' + axis] - center(a, axis)) *
+                    (b['target_' + axis] - center(b, axis)) > 0]
     output = {
         'strong_adjacent_reversals': len(flips),
         'reversals_with_position_still_on_same_side': len(same_side),

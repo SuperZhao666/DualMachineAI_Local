@@ -163,11 +163,15 @@ void partially_visible_body_keeps_identity() {
   // raw geometry for association; only the requested point is bounded visible.
   const std::array near{person(420,220)};
   const auto edge=core.process(near,{3,116'000,139'000});
-  check(edge.has_target && !edge.held && edge.track_id==initial.track_id,
-      "partly_occluded_body_remains_same_track",edge.held,0);
-  check(edge.target_x>=400 && edge.target_x<=416,"partial_body_aim_stays_visible",edge.target_x,416);
+  check(edge.has_target && edge.position_provisional && edge.track_id==initial.track_id,
+      "partly_occluded_body_remains_same_track",edge.position_provisional,1);
+  check(edge.target_x==continued.target_x,"partial_body_retains_only_accepted_anchor",edge.target_x,continued.target_x);
+  const auto accepted_edge=core.process(near,{4,124'000,147'000});
+  check(!accepted_edge.held && accepted_edge.lock_id==initial.lock_id &&
+      accepted_edge.target_x>=400 && accepted_edge.target_x<=416,
+      "confirmed_partial_body_aim_stays_visible",accepted_edge.target_x,416);
   const std::array outside{person(450,220)};
-  const auto absent=core.process(outside,{4,124'000,147'000});
+  const auto absent=core.process(outside,{5,132'000,155'000});
   check(absent.held && !absent.has_move(),"fully_outside_body_cannot_move",absent.delta_x,0);
   MobileControlCore invalid(c);
   const std::array enormous{YoloDetection{-10000,-10000,10000,10000,.99F,0}};
@@ -389,6 +393,10 @@ MobileControlConfig rebind_recovery_config() {
   c.observation_servo_enabled=true;
   c.lost_target_hold_duration_us=350'000;
   c.tracker.lost_track_duration_us=500'000;
+  // These fixtures compare a 48 ms rejected-ID prefix against same-owner
+  // rebind. Keep that prefix inside the explicitly configured switch window;
+  // ordinary configured replacements are covered independently.
+  c.switch_confirmation_duration_us=100'000;
   return c;
 }
 void rejected_first_observation_must_not_poison_replacement_identity() {
@@ -406,7 +414,9 @@ void rejected_first_observation_must_not_poison_replacement_identity() {
     bool withheld=true;
     for (unsigned i=1;i<=rejected_frames;++i) {
       const auto at=100'000+i*8'000U;
-      const std::array displaced{person(x+direction*60.0F+pan*i,240)};
+      // Below the explicit >=.75 unique-stranger fast-switch contract, but
+      // above ordinary rebind confidence: this isolates geometric recovery.
+      const std::array displaced{person(x+direction*60.0F+pan*i,240,100,.70F)};
       const auto out=core.process(displaced,{i+1,at,at+23'000,{at-8'000,pan,0,24,32,true}});
       withheld &= out.held && !out.has_move() && out.lock_id==first.lock_id;
     }

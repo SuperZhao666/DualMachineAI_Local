@@ -34,6 +34,78 @@ final class ControlOutputCoordinatorSelfTest {
         verifiesTargetProfileChangeFailsClosedAndAppliesModel();
         verifiesRepeatedHostPauseAckFailureAndModelSwitchAlwaysRearm();
         verifiesReconnectFailuresUseBoundedBackoff();
+        verifiesStaleLifecycleCannotReopenOutput();
+        verifiesCachedReportCannotUndoItsSynchronousEnable();
+    }
+
+    private static void verifiesCachedReportCannotUndoItsSynchronousEnable() {
+        ControlOutputCoordinator coordinator = new ControlOutputCoordinator(
+                new FakeMakcu(true), new FakeProfile(true), new FakeEvents());
+        MobileRuntimeReportStore.Cursor cursor = new MobileRuntimeReportStore.Cursor();
+        long generation = MobileRuntimeReportStore.begin();
+        MobileRuntimeReportStore.publish(generation, 100,
+                MobileRuntimeSnapshot.from("running=1", "output_requested=0 output_enabled=0", "ready=1", ""));
+        MobileRuntimeReportStore.Sample preEnable = MobileRuntimeReportStore.snapshot();
+        require(cursor.consume(preEnable,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(coordinator.isOutputEnabled());
+        // Native apply(true) completed after this sampled request=false. A
+        // periodic UI/health read of the same sample is not new evidence.
+        require(!cursor.consume(preEnable,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(coordinator.isOutputEnabled());
+        MobileRuntimeReportStore.publish(generation, 200,
+                MobileRuntimeSnapshot.from("running=1", "output_requested=1 output_enabled=1", "ready=1", ""));
+        require(cursor.consume(MobileRuntimeReportStore.snapshot(),
+                () -> coordinator.reconcileAutomaticState(true, true, true, true, false)));
+        require(coordinator.isOutputEnabled());
+    }
+
+    private static void verifiesStaleLifecycleCannotReopenOutput() {
+        MobileRuntimeAuthorization lifecycle = new MobileRuntimeAuthorization();
+        FakeMakcu transport = new FakeMakcu(true);
+        List<String> calls = new ArrayList<>();
+        ControlOutputCoordinator coordinator = new ControlOutputCoordinator(
+                transport, new FakeProfile(true, calls), new FakeEvents());
+        long sampled = lifecycle.updateForeground(true, () -> coordinator.failClosed("hidden"));
+        require(lifecycle.ifCurrent(sampled,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(coordinator.isOutputEnabled());
+        java.util.concurrent.CountDownLatch sampledHealthy = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseStaleTick = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread staleTick = new Thread(() -> {
+            try {
+                boolean oldHealthy = true;
+                sampledHealthy.countDown();
+                require(releaseStaleTick.await(3, java.util.concurrent.TimeUnit.SECONDS));
+                require(!lifecycle.ifCurrent(sampled,
+                        () -> coordinator.reconcileAutomaticState(oldHealthy, true, false, false, false)));
+            } catch (Throwable error) { failure.set(error); }
+        });
+        staleTick.start();
+        try {
+            require(sampledHealthy.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            lifecycle.updateForeground(false, () -> coordinator.failClosed("hidden"));
+            calls.clear();
+            releaseStaleTick.countDown();
+            staleTick.join(3000);
+            require(!staleTick.isAlive() && failure.get() == null);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw new AssertionError(interrupted);
+        } finally { releaseStaleTick.countDown(); }
+        require(!coordinator.isOutputEnabled() && !transport.outputDeliveryAllowed
+                && !calls.contains("profile:true"));
+        long replacement = lifecycle.updateForeground(true, () -> coordinator.failClosed("hidden"));
+        require(!lifecycle.ifCurrent(sampled,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(lifecycle.ifCurrent(replacement,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(coordinator.isOutputEnabled());
+        lifecycle.destroy(() -> coordinator.failClosed("destroyed"));
+        require(!lifecycle.ifCurrent(replacement,
+                () -> coordinator.reconcileAutomaticState(true, true, false, false, false)));
+        require(!coordinator.isOutputEnabled() && !transport.outputDeliveryAllowed);
     }
 
     private static void verifiesReconnectFailuresUseBoundedBackoff() {

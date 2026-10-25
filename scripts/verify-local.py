@@ -1,6 +1,7 @@
 """Audit the extracted source, packaged APK and matching local Host."""
 from pathlib import Path
 import hashlib, json, re, zipfile, shutil, argparse, subprocess, datetime, os
+from file_transaction import commit_files
 
 root=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
@@ -77,10 +78,6 @@ assert pipeline['status']=='passed_current_pipeline' and pipeline['duration_seco
 assert pipeline['apk_sha256']==sha(apk) and pipeline['host_sha256']==sha(exe), 'Pipeline evidence is for other artifacts'
 assert pipeline['files'] and all(sha(root/name)==digest for name,digest in pipeline['files'].items()), 'Pipeline evidence is stale'
 assert all(not (root/n).exists() for n in ['server','src/main.py','main.py','app_gui.py'])
-def copy_if_changed(source, target):
-    # A running Host is locked on Windows. Identical artifacts need no write.
-    if target.is_file() and sha(source)==sha(target): return
-    shutil.copy2(source,target)
 artifacts=[{'file':name,'bytes':p.stat().st_size,'sha256':sha(p)}
            for name,p in [('VisionForge-Local.apk',apk),('VFHost-Local.exe',exe)]]
 native_path=args.native_log if args.native_log.is_absolute() else root/args.native_log
@@ -187,10 +184,12 @@ if args.check_only:
 # Read-only validation must finish before publishing anything. A mismatched
 # installed APK or stale source evidence must not overwrite the usable dist
 # pair and then raise, leaving its old verification record beside new files.
-copy_if_changed(apk,dist/'VisionForge-Local.apk')
-copy_if_changed(exe,dist/'VFHost-Local.exe')
-shutil.copy2(root/'README.md',dist/'使用说明.md')
-(dist/'SHA256SUMS.txt').write_text(''.join(x['sha256']+'  '+x['file']+'\n' for x in artifacts))
-(root/'audit/apk-signature.txt').write_text(signature_text,encoding='utf-8')
-(root/'audit/verification.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+commit_files([
+    (dist/'VisionForge-Local.apk', apk),
+    (dist/'VFHost-Local.exe', exe),
+    (dist/'使用说明.md', root/'README.md'),
+    (dist/'SHA256SUMS.txt', ''.join(x['sha256']+'  '+x['file']+'\n' for x in artifacts).encode('utf-8')),
+    (root/'audit/apk-signature.txt', signature_text.encode('utf-8')),
+    (root/'audit/verification.json', json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8')),
+])
 print(json.dumps(report,ensure_ascii=False,indent=2))

@@ -21,6 +21,27 @@ final class MobilePipelineCoordinatorSelfTest {
         verifiesPreparedModelMismatchFailsClosed();
         verifiesPortableBackendUsesExplicitModelPath();
         verifiesPortableBackendRejectsMissingModelBeforeNativeCall();
+        verifiesFatalReceiverRecoveryVersusNormalIdle();
+    }
+
+    private static void verifiesFatalReceiverRecoveryVersusNormalIdle() {
+        FakePipeline nativePipeline = new FakePipeline(true, true, true);
+        MobilePipelineCoordinator coordinator = new MobilePipelineCoordinator(nativePipeline, new FakeEvents());
+        MobileRuntimeRetryPolicy retry = new MobileRuntimeRetryPolicy();
+        require(prepareAndOpen(coordinator, "/native", "/skeleton", 57L).started);
+        String startedCalls = nativePipeline.calls;
+        MobileRuntimeSnapshot idle = MobileRuntimeSnapshot.from("running=1 last_completed_access_unit_age_ms=9999",
+                "configured=1 qnn_executions=0", "ready=1", "");
+        require(!retry.recoverFatal(idle, coordinator::stop, () -> 100L));
+        require(nativePipeline.calls.equals(startedCalls));
+        MobileRuntimeSnapshot fatal = MobileRuntimeSnapshot.from("running=0",
+                "configured=0 decoder_failed=1", "ready=1", "");
+        require(retry.recoverFatal(fatal, coordinator::stop, () -> 100L));
+        require(nativePipeline.calls.equals(startedCalls + ",stop"));
+        require(!coordinator.isPreparedDataPlaneClosed() && !retry.mayAttempt(5099));
+        require(retry.mayAttempt(5100));
+        require(prepareAndOpen(coordinator, "/native", "/skeleton", 57L).started);
+        require(coordinator.isPreparedDataPlaneClosed());
     }
 
     private static void verifiesSuccessfulStartOrder() {

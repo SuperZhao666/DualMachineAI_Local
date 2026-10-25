@@ -32,6 +32,7 @@ final class ControlOutputCoordinator {
     private boolean usbWriteCompletedSinceEnable;
     private boolean automaticRetryDeferred;
     private boolean outputCloseConfirmed;
+    private boolean disposed;
     private final Set<String> lockReasonsReportedWhileClosed = new HashSet<>();
     private long lastUsbWriteCompletions;
     private long lastDeliveryFailures;
@@ -82,6 +83,7 @@ final class ControlOutputCoordinator {
             boolean nativeRequested,
             boolean nativeEffective,
             boolean recoverySuspended) {
+        if (disposed) return;
         this.runtimeHealthy = runtimeHealthy;
         this.nativeStateKnown = nativeStateKnown;
         this.nativeRequested = nativeRequested;
@@ -189,17 +191,24 @@ final class ControlOutputCoordinator {
     }
 
     synchronized void disable() {
+        if (disposed) return;
         runtimeHealthy = false;
         closeAutomaticGate("runtime_stopped");
     }
 
     synchronized void dispose() {
-        disable();
+        if (disposed) return;
+        // Invalidate already captured listeners before closing shared native
+        // state. Unregistering cannot recall a callback outside core's lock.
+        disposed = true;
+        runtimeHealthy = false;
+        closeAutomaticGate("runtime_stopped");
         outputTransport.setReconnectListener(null);
         if (buttonInput != null) buttonInput.setButtonStateListener(null);
     }
 
     synchronized void failClosed(String reason) {
+        if (disposed) return;
         runtimeHealthy = false;
         closeAutomaticGate(reason);
     }
@@ -244,39 +253,46 @@ final class ControlOutputCoordinator {
 
     synchronized void selectTargetProfile(
             MobileModelCatalog.Profile model, MobileAimTarget aimTarget) {
+        if (disposed) return;
         closeAutomaticGate("game_target_profile_changed");
         profile.selectTargetProfile(model, aimTarget);
         applyCurrentProfile();
     }
 
     synchronized void setGain(float value) {
+        if (disposed) return;
         profile.setGain(value);
         applyCurrentProfile();
     }
 
     synchronized void setDeadzone(float value) {
+        if (disposed) return;
         profile.setDeadzone(value);
         applyCurrentProfile();
     }
 
     synchronized void setMaximumAxisDelta(int value) {
+        if (disposed) return;
         profile.setMaximumAxisDelta(value);
         applyCurrentProfile();
     }
 
     synchronized void setSwitchConfirmationMillis(int value) {
+        if (disposed) return;
         profile.setSwitchConfirmationMillis(value);
         applyCurrentProfile();
     }
 
     synchronized void setProfile(float gain, float deadzonePixels, int maximumAxisDelta,
                                  int switchConfirmationMillis) {
+        if (disposed) return;
         profile.setValues(gain, deadzonePixels, maximumAxisDelta,
                 switchConfirmationMillis);
         applyCurrentProfile();
     }
 
     synchronized void setControlTrigger(ControlTrigger trigger) {
+        if (disposed) return;
         if (trigger == null) {
             events.write("control_trigger_rejected",
                     "reason=null_trigger preserved=" + profile.controlTrigger().storageToken);
@@ -309,18 +325,21 @@ final class ControlOutputCoordinator {
     }
 
     synchronized boolean importPersonalTrajectory(String profileJson) {
+        if (disposed) return false;
         boolean imported = profile.importPersonalTrajectory(profileJson);
         applyCurrentProfile();
         return imported;
     }
 
     synchronized void setPersonalTrajectoryEnabled(boolean enabled) {
+        if (disposed) return;
         profile.setPersonalTrajectoryEnabled(enabled);
         applyCurrentProfile();
     }
 
     synchronized void setPersonalTrajectoryScales(
             float speedScale, float stabilityScale, float variationScale) {
+        if (disposed) return;
         profile.setPersonalTrajectoryScales(
                 speedScale, stabilityScale, variationScale);
         applyCurrentProfile();
@@ -380,6 +399,7 @@ final class ControlOutputCoordinator {
      * complete runtime-health reconciliation.
      */
     synchronized void reconcileDeliveryState() {
+        if (disposed) return;
         MakcuDeliveryState delivery = outputTransport.deliveryState();
         if (delivery.failureCount > lastDeliveryFailures) {
             automaticRetryDeferred = true;
@@ -497,6 +517,7 @@ final class ControlOutputCoordinator {
 
     private void onButtonMaskChanged(int completeButtonMask) {
         synchronized (this) {
+            if (disposed) return;
             ControlTrigger trigger = profile.controlTrigger();
             // Close/re-arm immediately. Diagnostic formatting and enqueueing
             // must not precede the physical trigger's gate transition.
@@ -524,6 +545,7 @@ final class ControlOutputCoordinator {
     }
 
     private synchronized void onReconnectResult(boolean succeeded) {
+        if (disposed) return;
         boolean failedWhileActive = !succeeded
                 && (automaticOutputRequested || outputEnabled || outputRecoverySuspended);
         if (failedWhileActive) automaticRetryDeferred = true;

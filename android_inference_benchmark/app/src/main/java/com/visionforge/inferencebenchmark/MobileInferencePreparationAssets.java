@@ -51,7 +51,11 @@ final class MobileInferencePreparationAssets {
         return failure(
                 detail,
                 failure,
-                MobilePipelineCoordinator.FailureDisposition.RETRYABLE,
+                failure instanceof java.io.FileNotFoundException
+                        || failure instanceof MobilePackagedAssetException
+                        || failure instanceof IllegalArgumentException
+                        ? MobilePipelineCoordinator.FailureDisposition.TERMINAL_INCOMPATIBLE
+                        : MobilePipelineCoordinator.FailureDisposition.RETRYABLE,
                 "inference_asset_resolution_failed");
     }
 

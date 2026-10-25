@@ -166,17 +166,27 @@ def dependency_state(build, ninja, production):
             entries[current]['headers'].append(object_key(line.strip()))
         elif not line:
             current = None
+    # A CMake source-path normalization can retire old object filenames without
+    # deleting them. Verify the current Ninja compile graph, not orphaned disk
+    # outputs that Ninja no longer links or knows how to clean.
+    source_map = compilation_sources(build, ninja)
+    if not source_map:
+        raise DependencyError('Cannot reconcile the current Ninja compilation graph.')
     objects = []
+    obsolete_objects = []
     for path in (build / 'CMakeFiles').rglob('*.obj'):
         relative = path.relative_to(build)
         if len(relative.parts) < 3 or not relative.parts[1].endswith('.dir'):
             continue
         if not within(path.resolve(strict=True), build):
             raise DependencyError('A generated object resolves outside the verified build tree.')
-        objects.append(relative.as_posix())
+        name = relative.as_posix()
+        if object_key(name) in source_map:
+            objects.append(name)
+        else:
+            obsolete_objects.append(name)
     issues = []
     legitimate_zero = []
-    source_map = None
     counts = {}
     for name in sorted(objects):
         entry = entries.get(object_key(name))
@@ -184,8 +194,6 @@ def dependency_state(build, ninja, production):
         if entry is None:
             issues.append({'object':name, 'reason':'missing_dependency_record'})
         elif entry['count'] == 0:
-            if source_map is None:
-                source_map = compilation_sources(build, ninja)
             classification = classify_zero_dependency(source_map.get(object_key(name)))
             if classification['allowed'] and entry['status'] == 'VALID':
                 legitimate_zero.append({'object':name, **classification})
@@ -212,7 +220,9 @@ def dependency_state(build, ninja, production):
             for header in headers:
                 if not any(path.endswith('/'+header) for path in entry['headers']):
                     issues.append({'object':matches[0], 'reason':'critical_header_not_tracked', 'header':header})
-    return {'compiled_objects':len(objects), 'dependency_counts':counts, 'legitimate_zero':legitimate_zero, 'issues':issues}
+    return {'compiled_objects':len(objects), 'dependency_counts':counts,
+            'ignored_obsolete_objects':sorted(obsolete_objects),
+            'legitimate_zero':legitimate_zero, 'issues':issues}
 
 
 def compile_prefix(build, compiler):
@@ -227,7 +237,11 @@ def compile_prefix(build, compiler):
     source.write_text('#include "vfdual_dependency_probe.hpp"\nint vfdual_dependency_probe = VFDUAL_DEPENDENCY_PROBE;\n', encoding='ascii')
     # /EP emits a different encoding here. Match the real Ninja /c rule.
     result = subprocess.run([str(compiler), '/nologo', '/utf-8', '/showIncludes', '/c', str(source), '/Fo'+str(obj)],
-                            capture_output=True, creationflags=FLAGS)
+                            # Match Ninja's compiler console inheritance. A
+                            # detached probe uses ACP while an attached UTF-8
+                            # build uses the active console code page, yielding
+                            # different include-prefix bytes on the same PC.
+                            capture_output=True, creationflags=getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0))
     if result.returncode:
         raise DependencyError('MSVC compile-prefix probe failed: ' + result.stderr.decode('utf-8', errors='replace'))
     for line in (result.stdout + result.stderr).splitlines():

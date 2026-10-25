@@ -14,7 +14,7 @@ final class AsyncBluetoothMoveSink implements ControlOutputMoveSink, AutoCloseab
     private final MoveDeliveryTrace deliveryTrace = new MoveDeliveryTrace();
     private Move pending;
     private boolean closed;
-    private long accepted, rejected, cancelled, expired, recoveryCancelled, maximumQueueUs;
+    private long accepted, rejected, cancelled, expired, recoveryCancelled, generationRetired, maximumQueueUs;
     private final Thread worker;
 
     private static final class Move {
@@ -48,13 +48,30 @@ final class AsyncBluetoothMoveSink implements ControlOutputMoveSink, AutoCloseab
     @Override public boolean offerMoveBeforeDeadline(int x,int y,long ticket,long deadlineNanos) {
         if(ticket<=0L || deadlineNanos<=0L || (x==0 && y==0))return false;
         long now=clock.nowNanos();
-        long generation=transport.nativeDeliveryGeneration();
-        if (generation == 0) return false;
+        Move retired = null;
         synchronized (lock) {
-            if (closed || pending != null) { ++rejected; return false; }
-            pending=new Move(x,y,ticket,generation,now,deadlineNanos);
-            ++accepted; lock.notifyAll(); return true;
+            if (closed) { ++rejected; return false; }
+            // This volatile snapshot read is admission's linearization point.
+            // A later close still invalidates the move at core's send boundary.
+            BluetoothHidMouseTransportCore.DeliverySnapshot gate = transport.deliverySnapshot();
+            if (gate.generation == 0) { ++rejected; return false; }
+            if (pending != null && pending.generation != gate.generation) {
+                retired = pending; pending = null;
+                ++cancelled; ++generationRetired;
+                if (retired.generation <= gate.recoveryRetiredThrough) ++recoveryCancelled;
+            }
+            if (pending != null) { ++rejected; return false; }
+            pending=new Move(x,y,ticket,gate.generation,now,deadlineNanos);
+            ++accepted; lock.notifyAll();
         }
+        // Native has retired the prior generation before publishing a newer
+        // outstanding ticket. Do not synchronously reenter JNI from offer:
+        // native may still own its publish mutex. Preserve the old ticket in
+        // the trace, without completing or failing the newly admitted move.
+        if (retired != null) deliveryTrace.record(retired.ticket, retired.x, retired.y,
+                retired.offeredNanos, now, now, now, 0, retired.deadlineNanos,
+                retired.generation, 3, 0);
+        return true;
     }
 
     private void run() {
@@ -105,6 +122,7 @@ final class AsyncBluetoothMoveSink implements ControlOutputMoveSink, AutoCloseab
             return "bluetooth_dispatch=bounded_worker queued="+(pending == null ? 0 : 1)
                     +" accepted="+accepted+" rejected="+rejected+" cancelled="+cancelled
                     +" expired="+expired+" recovery_cancelled="+recoveryCancelled+" max_queue_us="+maximumQueueUs
+                    +" generation_retired="+generationRetired
                     +" timing_completion=android_api_return timing={"+timing.report()+"}";
         }
     }

@@ -172,6 +172,22 @@ int main() {
     vfdual::VideoFragment decoded;
     CHECK(vfdual::decode_video_packet(packet, decoded));
     CHECK(decoded.frame_id == 9 && decoded.fragment_index == 1 && decoded.fragment_count == 2);
+    static_assert(vfdual::kMaxDatagramBytes == 1420U);
+    const vfdual::VideoFragment maximal{10U, 0U, 1U,
+        std::vector<std::byte>(vfdual::kVideoPacketPayloadBytes, std::byte{0x65}),
+        23'000U, 640U, 640U};
+    const auto maximal_packet = vfdual::encode_video_packet(maximal);
+    vfdual::VideoFragment boundary_decoded;
+    CHECK(maximal_packet.size() == 1420U);
+    CHECK(vfdual::decode_video_packet(std::span(maximal_packet).first(1419U), boundary_decoded));
+    CHECK(vfdual::decode_video_packet(maximal_packet, boundary_decoded));
+    for (const std::size_t length : {1421U, 65507U}) {
+        auto oversized = maximal_packet;
+        oversized.resize(length, std::byte{0});
+        CHECK(!vfdual::decode_video_packet(oversized, boundary_decoded));
+        // max+1 receive capacity preserves an oversize witness after truncation.
+        CHECK(!vfdual::decode_video_packet(std::span(oversized).first(1421U), boundary_decoded));
+    }
     static_assert(vfdual::kMaxVideoFragmentsPerAccessUnit <
                   (std::numeric_limits<std::uint16_t>::max)());
     const auto excessive_fragment_count = static_cast<std::uint16_t>(

@@ -46,6 +46,23 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
     private String lastSessionDecisionReason = "";
     private boolean disposed;
     private long deliveryGeneration = 1;
+    static final class DeliverySnapshot {
+        final long generation, recoveryRetiredThrough;
+        DeliverySnapshot(long generation, long recoveryRetiredThrough) {
+            this.generation = generation; this.recoveryRetiredThrough = recoveryRetiredThrough;
+        }
+    }
+    private volatile DeliverySnapshot deliverySnapshot = new DeliverySnapshot(0, 0);
+
+    /** Lock-free authorization sample; mailbox admission must not invert the
+     * core/API monitor with its own lock or native completion callbacks. */
+    DeliverySnapshot deliverySnapshot() { return deliverySnapshot; }
+
+    private void publishDeliverySnapshotLocked() {
+        deliverySnapshot = new DeliverySnapshot(!disposed && outputDeliveryAllowed
+                && !nativeRecoverySuspended ? deliveryGeneration : 0,
+                recoveryRetiredDeliveryGeneration);
+    }
 
     BluetoothHidMouseTransportCore(
             SessionPort sessionPort,
@@ -85,6 +102,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
         ReconnectListener listener;
         boolean ready;
         synchronized (this) {
+            if (disposed) return;
             sessionPort.connectFirstSupportedHost();
             BluetoothHidOutputFailClosedPolicy.Decision decision =
                     BluetoothHidOutputFailClosedPolicy.evaluate(sessionPort.sessionState());
@@ -115,14 +133,17 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
             deliveryAllowedBeforeRecovery = false;
             recoveryCancelledDeliveryGeneration = 0L;
             recoveryRetiredDeliveryGeneration = 0L;
+            publishDeliverySnapshotLocked();
             return true;
         }
         if (nativeRecoverySuspended || !isReady()) {
             ++deliveryGeneration;
             outputDeliveryAllowed = false;
+            publishDeliverySnapshotLocked();
             return false;
         }
         outputDeliveryAllowed = true;
+        publishDeliverySnapshotLocked();
         return true;
     }
 
@@ -252,7 +273,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
 
     @Override
     public synchronized boolean suspendMoveDeliveryForNativeRecovery(long generation) {
-        if (generation <= 0L) return false;
+        if (generation <= 0L || disposed) return false;
         // A newer recovery supersedes the old resume token without losing
         // the delivery eligibility captured before the first hold.
         if (!nativeRecoverySuspended) {
@@ -267,6 +288,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
         outputDeliveryAllowed = false;
         nativeRecoverySuspended = true;
         recoveryGeneration = generation;
+        publishDeliverySnapshotLocked();
         return true;
     }
 
@@ -283,10 +305,12 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
         if (!isReady()) {
             outputDeliveryAllowed = false;
             deliveryAllowedBeforeRecovery = false;
+            publishDeliverySnapshotLocked();
             return false;
         }
         outputDeliveryAllowed = deliveryAllowedBeforeRecovery;
         deliveryAllowedBeforeRecovery = false;
+        publishDeliverySnapshotLocked();
         return outputDeliveryAllowed;
     }
 
@@ -299,6 +323,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
         recoveryGeneration = 0L;
         recoveryCancelledDeliveryGeneration = 0L;
         recoveryRetiredDeliveryGeneration = 0L;
+        publishDeliverySnapshotLocked();
         return true;
     }
 
@@ -312,6 +337,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
         recoveryGeneration = 0L;
         recoveryCancelledDeliveryGeneration = 0L;
         recoveryRetiredDeliveryGeneration = 0L;
+        publishDeliverySnapshotLocked();
     }
 
     /**
@@ -356,6 +382,7 @@ final class BluetoothHidMouseTransportCore implements ControlOutputTransport, Co
             recoveryGeneration = 0L;
             recoveryCancelledDeliveryGeneration = 0L;
             recoveryRetiredDeliveryGeneration = 0L;
+            publishDeliverySnapshotLocked();
         }
         sessionPort.setSessionStateListener(null);
     }

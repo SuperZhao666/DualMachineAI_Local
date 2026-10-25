@@ -337,8 +337,10 @@ class PortableRuntime final {
               model_contract_invalid,
           "portable input name is not images");
     }
-    const auto input_info = session_->GetInputTypeInfo(0U)
-        .GetTensorTypeAndShapeInfo();
+    // Tensor metadata is borrowed from TypeInfo. Keep its owner alive through
+    // every dtype/shape access, including contract-failure exception paths.
+    const auto input_type_info = session_->GetInputTypeInfo(0U);
+    const auto input_info = input_type_info.GetTensorTypeAndShapeInfo();
     if (input_info.GetElementType() !=
             ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
         !dimensions_match(
@@ -354,8 +356,8 @@ class PortableRuntime final {
     bool confidences_found = false;
     for (std::size_t index = 0; index < 2U; ++index) {
       auto output_name = session_->GetOutputNameAllocated(index, allocator);
-      const auto output_info = session_->GetOutputTypeInfo(index)
-          .GetTensorTypeAndShapeInfo();
+      const auto output_type_info = session_->GetOutputTypeInfo(index);
+      const auto output_info = output_type_info.GetTensorTypeAndShapeInfo();
       if (output_info.GetElementType() !=
           ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
         throw PortablePermanentInitializationError(

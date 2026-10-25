@@ -10,7 +10,12 @@ namespace vfdual_android {
 // in a captured frame. The timestamp is API acceptance, not physical ACK.
 class MobilePendingMotion final {
  public:
-  struct Prediction { float x{}, y{}; std::uint32_t reports{}; };
+  struct Prediction {
+    // Position compensation stays at the nominal delay. Risk bounds are the
+    // extrema over all plausible delays, including mixed-sign report history.
+    float x{}, y{}; std::uint32_t reports{};
+    float minimum_x{}, maximum_x{}, minimum_y{}, maximum_y{};
+  };
   static constexpr std::uint64_t kExpectedVisibilityUs = 32'000U;
   static constexpr std::uint64_t kMaximumVisibilityUs = 100'000U;
   // Keep recent history beyond the current delay estimate. A later delay
@@ -24,6 +29,12 @@ class MobilePendingMotion final {
   }
   [[nodiscard]] Prediction predict(std::uint64_t observed_at_us,
                                    std::uint64_t visibility_us = kExpectedVisibilityUs) noexcept {
+    return predict(observed_at_us,visibility_us,visibility_us,visibility_us);
+  }
+  [[nodiscard]] Prediction predict(std::uint64_t observed_at_us,
+                                   std::uint64_t visibility_us,
+                                   std::uint64_t minimum_visibility_us,
+                                   std::uint64_t maximum_visibility_us) noexcept {
     std::size_t retired{};
     while (retired < size_ && observed_at_us >= entries_[retired].at_us &&
            observed_at_us - entries_[retired].at_us >= kMaximumVisibilityUs) ++retired;
@@ -31,9 +42,34 @@ class MobilePendingMotion final {
     size_ -= retired;
     Prediction result{};
     const auto delay = std::min(visibility_us,kMaximumVisibilityUs);
+    auto low=std::min(minimum_visibility_us,kMaximumVisibilityUs);
+    auto high=std::min(maximum_visibility_us,kMaximumVisibilityUs);
+    if(low>high) std::swap(low,high);
+    low=std::min(low,delay); high=std::max(high,delay);
     for (std::size_t i = 0; i < size_; ++i) {
       if (observed_at_us >= entries_[i].at_us && observed_at_us-entries_[i].at_us >= delay) continue;
       result.x += entries_[i].x; result.y += entries_[i].y; ++result.reports;
+    }
+    result.minimum_x=result.maximum_x=result.x;
+    result.minimum_y=result.maximum_y=result.y;
+    if(low==high) return result;
+    const auto include=[&](std::uint64_t hypothesis) {
+      float x{},y{}; std::uint32_t reports{};
+      for(std::size_t i{};i<size_;++i) {
+        if(observed_at_us>=entries_[i].at_us && observed_at_us-entries_[i].at_us>=hypothesis) continue;
+        x+=entries_[i].x; y+=entries_[i].y; ++reports;
+      }
+      result.minimum_x=std::min(result.minimum_x,x); result.maximum_x=std::max(result.maximum_x,x);
+      result.minimum_y=std::min(result.minimum_y,y); result.maximum_y=std::max(result.maximum_y,y);
+      result.reports=std::max(result.reports,reports);
+    };
+    include(low); include(high);
+    // Pending sums change only just after an entry's visibility boundary.
+    // Enumerating those boundaries is exact for this bounded step-response
+    // ledger and does not assume same-sign commands or an interpolation model.
+    for(std::size_t i{};i<size_;++i) if(observed_at_us>=entries_[i].at_us) {
+      const auto age=observed_at_us-entries_[i].at_us;
+      if(age>=low && age<high) include(age+1U);
     }
     return result;
   }
@@ -53,6 +89,11 @@ class MobilePendingMotion final {
     if (requested > 0) return std::min(requested, std::max(0, int(std::floor(budget-pending))));
     if (requested < 0) return std::max(requested, std::min(0, int(std::ceil(-budget-pending))));
     return 0;
+  }
+  [[nodiscard]] static int bound_axis(int requested, float minimum_pending,
+                                      float maximum_pending, int budget) noexcept {
+    if(minimum_pending>maximum_pending) std::swap(minimum_pending,maximum_pending);
+    return bound_axis(requested,requested>0?maximum_pending:minimum_pending,budget);
   }
   void reset() noexcept { size_ = 0U; }
  private:

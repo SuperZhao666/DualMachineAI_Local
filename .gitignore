@@ -14,3 +14,9 @@ dist/
 *.sqlite
 *.zip
 owner_secrets/
+/audit/
+/output/
+/tmp_*/
+__pycache__/
+*.py[cod]
+*.onnx

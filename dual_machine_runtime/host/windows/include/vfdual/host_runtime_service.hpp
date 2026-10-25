@@ -144,7 +144,8 @@ public:
     HostRuntimeService(const HostRuntimeService&) = delete;
     HostRuntimeService& operator=(const HostRuntimeService&) = delete;
 
-    [[nodiscard]] bool start(const HostStreamSettings& settings, std::string& error);
+    [[nodiscard]] bool start(const HostStreamSettings& settings, std::string& error,
+                             std::stop_token operation_stop_token = {});
     void request_stop() noexcept;
     void stop() noexcept;
     /** Restores only a VisionForge-owned CAT6 snapshot after the GUI has stopped DHCP. */

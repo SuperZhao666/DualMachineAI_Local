@@ -6,6 +6,7 @@
     <string name="action_export_runtime_log">导出运行日志</string>
     <string name="runtime_log_export_filename">VFMobile-runtime-log.jsonl</string>
     <string name="status_runtime_log_exported">运行日志已导出。</string>
+    <string name="status_runtime_log_exporting">正在导出运行日志，可继续操作。</string>
     <string name="status_runtime_log_export_failed">运行日志导出失败，请重试。</string>
 
     <string name="connection_live">主机已连接</string>
@@ -58,10 +59,12 @@
     <string name="preset_precise">精细</string>
     <string name="preset_custom">自定义</string>
     <string name="section_fine_tuning">精细调节</string>
-    <string name="control_gain">相对增益</string>
+    <string name="control_gain">跟随响应（60Hz 收敛比例）</string>
+    <string name="control_gain_detail">有效范围 0.01–0.95，数值越大位置误差收敛越快。超过 0.95 的旧设置折算为 0.95，保留原有效响应。</string>
     <string name="control_deadzone">死区</string>
     <string name="control_max_axis">单轴请求上限</string>
-    <string name="control_switch_confirmation">目标切换确认</string>
+    <string name="control_switch_confirmation">普通目标切换确认</string>
+    <string name="control_switch_confirmation_detail">唯一高置信陌生目标保留两帧、至少约 8ms 的快切例外；已知邻人、弱或不明确的候选仍受原保护。</string>
     <string name="control_switch_confirmation_value">%1$d ms</string>
     <string name="control_effective_limits">当前有效：未标定安全上限 %1$d；单步上限 %2$.0f；步间变化上限 %3$.0f。</string>
     <string name="control_effective_limits_pending">当前有效限幅等待原生控制配置。</string>
@@ -84,7 +87,7 @@
     <string name="status_gain_adjusted">相对增益已调整为 %1$.2f。</string>
     <string name="status_deadzone_adjusted">死区已调整为 %1$.1f px。</string>
     <string name="status_max_axis_adjusted">单轴请求上限已调整为 %1$d；实际生效值见安全限幅说明。</string>
-    <string name="status_switch_confirmation_adjusted">目标切换确认已调整为 %1$d ms；只控制换目标稳定性，不限制任何帧率。</string>
+    <string name="status_switch_confirmation_adjusted">普通目标切换确认已调整为 %1$d ms；唯一高置信陌生目标仍可两帧快切，不限制帧率。</string>
     <string name="status_custom_adjustment">已进入自定义调节；拖动任意参数后立即保存并应用。</string>
     <string name="status_preset_applied">已应用“%1$s”参数预设。</string>
     <string name="status_control_trigger_applied">触发方式已切换为“%1$s”；切换期间物理输出已闭锁并重新校验。</string>

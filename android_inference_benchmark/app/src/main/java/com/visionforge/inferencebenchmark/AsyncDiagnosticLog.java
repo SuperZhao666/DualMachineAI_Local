@@ -7,6 +7,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.ArrayList;
 
 /** Bounded, rotating local log. Producers never wait for disk or logcat. */
 final class AsyncDiagnosticLog {
@@ -133,21 +134,68 @@ final class AsyncDiagnosticLog {
 
     long exportTo(OutputStream destination) throws IOException {
         flush();
-        long copied = 0;
-        synchronized (ioLock) {
-            if (output != null) output.flush();
-            for (int index = retainedSegments - 1; index >= 0; --index) {
-                File source = index == 0 ? file : rotated(index);
-                if (!source.isFile()) continue;
-                try (InputStream input = new FileInputStream(source)) {
-                    byte[] buffer = new byte[16 * 1024];
-                    for (int size; (size = input.read(buffer)) >= 0;) {
-                        destination.write(buffer, 0, size); copied += size;
-                    }
+        ArrayList<SnapshotSegment> snapshot = new ArrayList<>();
+        try {
+            synchronized (ioLock) {
+                if (output != null) output.flush();
+                for (int index = retainedSegments - 1; index >= 0; --index) {
+                    File source = index == 0 ? file : rotated(index);
+                    if (source.isFile()) snapshot.add(SnapshotSegment.open(source));
                 }
             }
+            // Only local handles/aliases and byte limits are acquired under
+            // the writer lock. Provider I/O cannot prevent rotation or writes.
+            long copied = 0;
+            byte[] buffer = new byte[16 * 1024];
+            for (SnapshotSegment segment : snapshot) {
+                long remaining = segment.length;
+                while (remaining > 0) {
+                    if (Thread.currentThread().isInterrupted())
+                        throw new InterruptedIOException("diagnostic export cancelled");
+                    int size = segment.input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (size < 0) throw new EOFException("diagnostic snapshot truncated");
+                    destination.write(buffer, 0, size);
+                    copied += size;
+                    remaining -= size;
+                }
+            }
+            destination.flush();
+            return copied;
+        } finally {
+            IOException cleanupFailure = null;
+            for (SnapshotSegment segment : snapshot) {
+                try { segment.close(); } catch (IOException failure) { cleanupFailure = failure; }
+            }
+            if (cleanupFailure != null) failures.incrementAndGet();
         }
-        destination.flush();
-        return copied;
+    }
+
+    private static final class SnapshotSegment implements Closeable {
+        final FileInputStream input;
+        final long length;
+        final java.nio.file.Path alias;
+        private SnapshotSegment(FileInputStream input, long length, java.nio.file.Path alias) {
+            this.input = input; this.length = length; this.alias = alias;
+        }
+        static SnapshotSegment open(File source) throws IOException {
+            long length = source.length();
+            java.nio.file.Path alias = source.toPath().resolveSibling(
+                    "." + source.getName() + ".export-" + java.util.UUID.randomUUID());
+            try {
+                // NTFS aliases avoid Windows open-handle rename restrictions.
+                // App-private Android filesystems may also support this path.
+                Files.createLink(alias, source.toPath());
+                return new SnapshotSegment(new FileInputStream(alias.toFile()), length, alias);
+            } catch (IOException | UnsupportedOperationException unavailable) {
+                Files.deleteIfExists(alias);
+                // Android's emulated storage can reject hard links. A POSIX
+                // open descriptor retains the inode through rename/unlink.
+                return new SnapshotSegment(new FileInputStream(source), length, null);
+            }
+        }
+        @Override public void close() throws IOException {
+            try { input.close(); }
+            finally { if (alias != null) Files.deleteIfExists(alias); }
+        }
     }
 }

@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "NativeH264Decoder.hpp"
+#include "DatagramReceiveResult.hpp"
 #include "ReceiverIdleBackoff.hpp"
 #include "ReceiverRepeatResyncPolicy.hpp"
 #include "ReceiverRecoveryPolicy.hpp"
@@ -544,7 +545,9 @@ private:
 
   void run(int socket) {
     vfdual::AccessUnitReassembler reassembler(kMaximumInflightAccessUnits);
-    std::array<std::byte, vfdual::kMaxDatagramBytes> datagram{};
+    // One extra byte distinguishes an oversized valid prefix after recvfrom
+    // truncation from an exact legal maximum-sized packet.
+    std::array<std::byte, vfdual::kMaxDatagramBytes + 1U> datagram{};
     std::uint32_t consecutive_socket_errors{};
     bool source_restart_pending{};
     bool receive_timeout_backoff_available{true};
@@ -556,6 +559,9 @@ private:
       socklen_t sender_size = sizeof(sender);
       const ssize_t received = ::recvfrom(socket, datagram.data(), datagram.size(), 0,
           reinterpret_cast<sockaddr*>(&sender), &sender_size);
+      const int receive_errno = received < 0 ? errno : 0;
+      const auto receive_result = vfdual_android::classify_datagram_receive(
+          received, receive_errno);
       const auto now_us = monotonic_microseconds();
       if (source_restart_pending) {
         const auto completion =
@@ -586,7 +592,15 @@ private:
               idr_requested ? 1 : 0, idr_requested ? 0 : errno);
         }
       }
-      if (received <= 0) {
+      if (receive_result == vfdual_android::DatagramReceiveResult::empty) {
+        // Zero bytes is a successfully received (invalid protocol) datagram,
+        // including from a foreign source. It cannot inherit an old errno or
+        // refresh the last accepted-video time.
+        consecutive_socket_errors = 0;
+        ++metrics_.rejected_datagrams;
+        continue;
+      }
+      if (received < 0) {
         if (!running_) break;
         if (vfdual_android::decoder().has_stream_restart_timed_out()) {
           record_source_restart_timeout();
@@ -596,7 +610,7 @@ private:
           running_ = false;
           break;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (receive_result == vfdual_android::DatagramReceiveResult::timeout) {
           consecutive_socket_errors = 0;
           ++metrics_.receiver_timeouts;
           const std::uint64_t idle_us = now_us >= last_accepted_datagram_us
@@ -620,12 +634,12 @@ private:
           }
           continue;
         }
-        if (errno == EINTR) continue;
-        metrics_.last_socket_errno = errno;
+        if (receive_result == vfdual_android::DatagramReceiveResult::interrupted) continue;
+        metrics_.last_socket_errno = receive_errno;
         ++metrics_.fatal_socket_errors;
         __android_log_print(ANDROID_LOG_ERROR, kTag,
             "video receiver socket error errno=%d consecutive=%u running=%d",
-            errno, consecutive_socket_errors + 1U, running_.load() ? 1 : 0);
+            receive_errno, consecutive_socket_errors + 1U, running_.load() ? 1 : 0);
         if (++consecutive_socket_errors < 3U) {
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
           continue;
@@ -634,6 +648,10 @@ private:
       }
       consecutive_socket_errors = 0;
       vfdual::VideoFragment fragment;
+      if (static_cast<std::size_t>(received) > vfdual::kMaxDatagramBytes) {
+        ++metrics_.rejected_datagrams;
+        continue;
+      }
       if (!vfdual::decode_video_packet(std::span<const std::byte>(datagram.data(), static_cast<std::size_t>(received)), fragment)) {
         ++metrics_.rejected_datagrams;
         continue;

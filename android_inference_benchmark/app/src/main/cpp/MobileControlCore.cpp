@@ -385,7 +385,8 @@ void MobileControlCore::abandon_pending_visible_ego_motion() noexcept {
   // otherwise the timeout frame can immediately compound one uncertain move
   // with an unrelated replacement target.
   tracker_.reset();
-  known_track_id_ceiling_ = 0U;
+  known_neighbours_.clear();
+  seen_track_frontier_=owner_seen_frontier_=0U;
   locked_candidate_ = {};
   has_lock_ = false;
   reacquisition_requires_confirmation_ = true;
@@ -689,6 +690,7 @@ bool MobileControlCore::build_candidates(
   tracker_.update_into(
       validated_detections_, sequence, observed_at_us,
       tracked_detections_,image_constraints);
+  update_known_track_presence(observed_at_us);
   auto& raw_frame=raw_track_history_[raw_track_cursor_++%raw_track_history_.size()];
   raw_frame={};raw_frame.at=observed_at_us;
   for(std::size_t i=0;i<std::min(detections.size(),raw_frame.ids.size());++i) {
@@ -794,8 +796,8 @@ MobileControlCore::Candidate MobileControlCore::candidate_for(
     candidate.track_id = paired_body->track_id != 0 ? paired_body->track_id : tracked.track_id;
     candidate.has_body_pair = true;
   }
-  candidate.track_was_known = candidate.track_id != 0 &&
-      candidate.track_id <= known_track_id_ceiling_;
+  candidate.track_was_known = known_neighbours_.contains(candidate.track_id);
+  candidate.stranger_eligible = candidate.track_id>owner_seen_frontier_;
   const float width = detection.x2 - detection.x1;
   const float height = detection.y2 - detection.y1;
   if (source == AimSource::head) {
@@ -943,7 +945,7 @@ std::uint64_t MobileControlCore::missing_lock_hold_duration_us() noexcept {
   // A co-visible neighbour is evidence of a different person, not evidence
   // that the retained owner has gone for good. Do not hand it the lock while
   // the tracker still retains the original identity through a brief occlusion.
-  const bool known_neighbour = std::any_of(candidates_.begin(), candidates_.end(),
+  const bool known_neighbour = known_neighbours_.incomplete() || std::any_of(candidates_.begin(), candidates_.end(),
       [&](const Candidate& candidate) {
         return candidate.track_was_known && !same_candidate_identity(locked_candidate_, candidate);
       });
@@ -1214,7 +1216,7 @@ bool MobileControlCore::same_candidate_identity(
 bool MobileControlCore::track_id_rebind_admissible(
     const Candidate& candidate, bool* giou_only) const noexcept {
   if (giou_only != nullptr) *giou_only = false;
-  if (!config_.track_id_rebind_enabled ||
+  if (known_neighbours_.incomplete() || !config_.track_id_rebind_enabled ||
       locked_candidate_.source != candidate.source ||
       locked_candidate_.track_id == 0 || candidate.track_id == 0 ||
       locked_candidate_.track_id == candidate.track_id ||
@@ -1265,7 +1267,7 @@ bool MobileControlCore::track_id_rebind_admissible(
   return iou >= config_.track_id_rebind_min_iou || giou_match || body_match;
 }
 
-bool MobileControlCore::match_locked(Candidate& result) noexcept {
+bool MobileControlCore::match_locked(Candidate& result, std::uint64_t observed_at_us) noexcept {
   bool found = false;
   float best_iou = -1.0F;
   float best_distance = std::numeric_limits<float>::max();
@@ -1317,6 +1319,17 @@ bool MobileControlCore::match_locked(Candidate& result) noexcept {
         candidate.track_id != locked_candidate_.track_id) {
       ++different_track_candidates;
       bool giou_only = false;
+      // A fresh current frame cannot resurrect an old control identity after
+      // both its control and tracker retention have expired. This shared match
+      // path also serves tracking-only updates; no whole-Core reset is needed.
+      const auto identity_retention_us=std::max(config_.lost_target_hold_duration_us,
+          config_.tracker.lost_track_duration_us);
+      if(identity_retention_us && observed_at_us>last_target_observed_at_us_ &&
+          observed_at_us-last_target_observed_at_us_>identity_retention_us) {
+        ++metrics_.rejected_track_id_mismatches;
+        ++metrics_.rejected_rebind_geometry;
+        continue;
+      }
       if (track_id_rebind_admissible(candidate, &giou_only)) {
         ++admissible_rebind_candidates;
         if (admissible_rebind_candidates == 1U) {
@@ -1361,7 +1374,7 @@ bool MobileControlCore::match_locked(Candidate& result) noexcept {
 }
 
 bool MobileControlCore::visible_replacement_ready(Candidate& result) const noexcept {
-  if (!config_.observation_servo_enabled || !has_lock_ || candidates_.size() != 1U) return false;
+  if (known_neighbours_.incomplete() || !config_.observation_servo_enabled || !has_lock_ || candidates_.size() != 1U) return false;
   const Candidate& candidate = candidates_.front();
   if (candidate.detection.confidence <
       std::max(0.75F, config_.missing_switch_min_confidence)) return false;
@@ -1375,7 +1388,14 @@ bool MobileControlCore::visible_replacement_ready(Candidate& result) const noexc
 
 bool MobileControlCore::update_pending_switch(
     const Candidate& challenger, std::uint64_t observed_at_us) noexcept {
-  const bool fast = config_.observation_servo_enabled && !has_lock_ &&
+  // Tracker-retained extent during an abrupt expansion/contraction is not an
+  // independent current geometry observation. It cannot lend its timer to a
+  // fast handoff; normal confirmation also restarts with coherent geometry.
+  if(challenger.motion_discontinuity) {
+    clear_pending_switch();
+    return false;
+  }
+  const bool fast = !known_neighbours_.incomplete() && config_.observation_servo_enabled && !has_lock_ &&
       fresh_encounter_armed_ && challenger.detection.confidence >=
           std::max(.75F, config_.missing_switch_min_confidence);
   if (!has_pending_switch_ || !association_admissible(pending_candidate_, challenger)) {
@@ -1407,30 +1427,30 @@ bool MobileControlCore::update_pending_switch(
   return enough_frames && enough_time;
 }
 
+void MobileControlCore::update_known_track_presence(std::uint64_t observed_at_us) noexcept {
+  known_neighbours_.advance(observed_at_us,config_.tracker.lost_track_duration_us);
+  for(const auto& tracked:tracked_detections_) {
+    seen_track_frontier_=std::max(seen_track_frontier_,tracked.track_id);
+    if(!has_lock_ || tracked.track_id!=locked_candidate_.track_id)
+      known_neighbours_.observe(tracked.track_id,observed_at_us,config_.tracker.lost_track_duration_us);
+  }
+}
+
 void MobileControlCore::remember_candidate_tracks() {
-  // Co-visible tracks establish that a candidate is a different person.
-  // While the owner is missing, a replacement ID may fail the geometry gate
-  // initially and align on a later observation. Seeing that ID alone must not
-  // permanently classify it as a neighbour for this retained lock.
-  if (config_.observation_servo_enabled && has_lock_ &&
-      std::none_of(candidates_.begin(), candidates_.end(), [&](const Candidate& candidate) {
-        return same_candidate_identity(locked_candidate_, candidate);
-      })) {
-    return;
-  }
-  for (const Candidate& candidate : candidates_) {
-    known_track_id_ceiling_ = std::max(
-        known_track_id_ceiling_, candidate.track_id);
-  }
+  if(!has_lock_ || std::none_of(candidates_.begin(),candidates_.end(),[&](const Candidate& candidate) {
+      return same_candidate_identity(locked_candidate_,candidate);
+    }))return;
+  owner_seen_frontier_=seen_track_frontier_;
+  for(const auto& candidate:candidates_)if(!same_candidate_identity(locked_candidate_,candidate))
+    known_neighbours_.remember(candidate.track_id,last_frame_observed_at_us_,config_.tracker.lost_track_duration_us);
 }
 
 void MobileControlCore::accept_candidate(
     const Candidate& incoming, const ControlFrameContext& frame, bool switched) noexcept {
   Candidate candidate = incoming;
   const bool starts_new_lock = !has_lock_ || switched;
-  const bool rebound = has_lock_ && config_.observation_servo_enabled &&
-      candidate.track_id != locked_candidate_.track_id;
-  if (!has_lock_ || switched) position_spike_held_ = false;
+  const bool rebound = has_lock_ && candidate.track_id != locked_candidate_.track_id;
+  if (!has_lock_ || switched || rebound) position_spike_held_ = false;
   if (has_lock_ && !switched && !rebound && last_target_observed_at_us_ != 0 &&
       frame.observed_at_us > last_target_observed_at_us_) {
     const float spike_dt = static_cast<float>(frame.observed_at_us - last_target_observed_at_us_) /
@@ -1442,25 +1462,28 @@ void MobileControlCore::accept_candidate(
     const float spike_gate = std::max(18.F, spike_expected + 12.F);
     const bool spike = spike_jump > spike_gate &&
         spike_jump > 3.F * std::max(1.F, spike_expected);
-    if (spike && !position_spike_held_) {
-      const auto track_id = candidate.track_id;
-      const auto confidence = candidate.detection.confidence;
-      const auto source = candidate.source;
-      candidate.detection = locked_candidate_.detection;
-      candidate.detection.confidence = confidence;
-      candidate.track_id = track_id;
-      candidate.source = source;
-      candidate.target_x = locked_candidate_.target_x;
-      candidate.target_y = locked_candidate_.target_y;
-      candidate.anchor_x = locked_candidate_.anchor_x;
-      candidate.anchor_y = locked_candidate_.anchor_y;
+    bool consecutive_confirmation=false;
+    if(position_spike_held_ && raw_track_cursor_>=2U) {
+      const auto& previous=raw_track_history_[(raw_track_cursor_-2U)%raw_track_history_.size()];
+      consecutive_confirmation=previous.at && frame.observed_at_us>previous.at &&
+          frame.observed_at_us-previous.at<=kContinuousControlMaximumObservationAgeUs &&
+          std::find(previous.ids.begin(),previous.ids.end(),candidate.track_id)!=previous.ids.end();
+    }
+    if (spike && !consecutive_confirmation) {
+      // Retain the old owner, but do not manufacture a fresh observation at
+      // its previous position. The caller emits a held result for this frame;
+      // neither the accepted-position timestamp nor its derivative advances.
       position_spike_held_ = true;
+      provisional_candidate_ = candidate;
+      return;
     } else {
       position_spike_held_ = false;
     }
     const float delta_seconds = static_cast<float>(frame.observed_at_us - last_target_observed_at_us_) / 1'000'000.0F;
     float target_displacement_x = candidate.target_x - locked_candidate_.target_x;
     float target_displacement_y = candidate.target_y - locked_candidate_.target_y;
+    const float control_displacement_x=target_displacement_x;
+    const float control_displacement_y=target_displacement_y;
     const float raw_velocity_x = target_displacement_x / delta_seconds;
     const float raw_velocity_y = target_displacement_y / delta_seconds;
     const float alpha = config_.velocity_update_alpha;
@@ -1503,6 +1526,16 @@ void MobileControlCore::accept_candidate(
       }
       const bool trusted_x = response_estimator_.x().trusted;
       const bool trusted_y = response_estimator_.y().trusted;
+      const bool stationary_geometry = background_valid_this_frame_ && frame.background.support>=16U &&
+          !shape_discontinuity && candidates_.size()==1U && candidate.detection.confidence>=.75F &&
+          box_size_compatible(locked_candidate_.detection,candidate.detection,.98F,1.02F);
+      const bool consecutive_geometry=feedback_frame_interval_us_!=0U &&
+          feedback_frame_interval_us_<=kContinuousControlMaximumObservationAgeUs &&
+          frame.observed_at_us-last_target_observed_at_us_==feedback_frame_interval_us_;
+      stationary_x_evidence_=stationary_geometry && consecutive_geometry &&
+          std::abs(control_displacement_x)<.001F;
+      stationary_y_evidence_=stationary_geometry && consecutive_geometry &&
+          std::abs(control_displacement_y)<.001F;
       if (background_valid_this_frame_ || trusted_x || trusted_y) {
         if (!background_valid_this_frame_) target_displacement_x = target_displacement_y = 0.0F;
         const auto velocity = shape_discontinuity ? MobileTargetVelocity::Velocity{} :
@@ -1524,6 +1557,10 @@ void MobileControlCore::accept_candidate(
                   pending_prediction_.reports==0 && background_valid_this_frame_ &&
                   quiet_background_since_us_ &&
                   frame.observed_at_us-quiet_background_since_us_>=30'000U);
+          stationary_x_evidence_=stationary_geometry && (disturbance.x_stationary ||
+              (consecutive_geometry && std::abs(control_displacement_x)<.001F));
+          stationary_y_evidence_=stationary_geometry && (disturbance.y_stationary ||
+              (consecutive_geometry && std::abs(control_displacement_y)<.001F));
           diagnostic_disturbance_x_ = disturbance.x; diagnostic_disturbance_y_ = disturbance.y;
           diagnostic_disturbance_motion_=disturbance;
           diagnostic_disturbance_evaluated_=true;
@@ -1566,7 +1603,7 @@ void MobileControlCore::accept_candidate(
   has_lock_ = true;
   crowd_identity_hold_ = false;
   if (starts_new_lock) {
-    known_track_id_ceiling_ = 0U;
+    known_neighbours_.clear();
     remember_candidate_tracks();
   }
   missing_frames_ = 0;
@@ -1627,7 +1664,7 @@ bool MobileControlCore::refresh_locked_candidate(
     accept_same_identity_head_upgrade(candidate, frame);
     return true;
   }
-  if (has_lock_ && match_locked(candidate)) {
+  if (has_lock_ && match_locked(candidate,frame.observed_at_us)) {
     if (is_head_projection_recovery(candidate)) {
       accept_head_projection_recovery(candidate, frame);
     } else {
@@ -1794,16 +1831,51 @@ ControlSuppressionReason MobileControlCore::control_suppression_reason(
   return ControlSuppressionReason::motion_invalid;
 }
 
+MobileControlOutput MobileControlCore::provisional_output(const ControlFrameContext& frame) noexcept {
+  auto held=held_output(ControlSuppressionReason::lock_held);
+  held.position_provisional=true;
+  if(!config_.observation_servo_enabled || config_.selected_class_uses_head_box ||
+      candidates_.size()!=1U || provisional_candidate_.track_id!=locked_candidate_.track_id ||
+      provisional_candidate_.motion_discontinuity || provisional_candidate_.detection.confidence<.75F ||
+      locked_candidate_.detection.confidence<.75F ||
+      !box_size_compatible(locked_candidate_.detection,provisional_candidate_.detection,.85F,1.18F))return held;
+  // The retained anchor is an explicit prior hypothesis; the raw anchor is
+  // current evidence. Their common direction is conservative for both, without
+  // claiming that unknown camera motion establishes a physical truth interval.
+  const auto common_error=[](float before,float incoming,float center) {
+    const float a=before-center,b=incoming-center;
+    return a*b>0.F?std::copysign(std::min(std::abs(a),std::abs(b)),a):0.F;
+  };
+  const float x=common_error(locked_candidate_.target_x,provisional_candidate_.target_x,config_.model_center_x);
+  const float y=common_error(locked_candidate_.target_y,provisional_candidate_.target_y,config_.model_center_y);
+  if(x==0.F && y==0.F)return held;
+  auto proposal=provisional_candidate_;
+  proposal.target_x=proposal.anchor_x=config_.model_center_x+x;
+  proposal.target_y=proposal.anchor_y=config_.model_center_y+y;
+  proposal.detection.x1=std::min(locked_candidate_.detection.x1,proposal.detection.x1);
+  proposal.detection.y1=std::min(locked_candidate_.detection.y1,proposal.detection.y1);
+  proposal.detection.x2=std::max(locked_candidate_.detection.x2,proposal.detection.x2);
+  proposal.detection.y2=std::max(locked_candidate_.detection.y2,proposal.detection.y2);
+  auto output=active_output(frame,false,&proposal);
+  if(output.delta_x*x<=0.F)output.delta_x=0;
+  if(output.delta_y*y<=0.F)output.delta_y=0;
+  if(!output.has_move() && output.suppression_reason==ControlSuppressionReason::none) {
+    output.held=true;output.suppression_reason=ControlSuppressionReason::lock_held;
+  }
+  return output;
+}
+
 MobileControlOutput MobileControlCore::active_output(
-    const ControlFrameContext& frame, bool switched) noexcept {
-  const float target_x = locked_candidate_.target_x;
-  const float target_y = locked_candidate_.target_y;
-  const YoloDetection& box = locked_candidate_.detection;
+    const ControlFrameContext& frame, bool switched, const Candidate* provisional) noexcept {
+  const auto& control_candidate=provisional?*provisional:locked_candidate_;
+  const float target_x = control_candidate.target_x;
+  const float target_y = control_candidate.target_y;
+  const YoloDetection& box = control_candidate.detection;
   float minimum_target_x = std::max(0.0F, box.x1);
   float maximum_target_x = std::min(config_.model_width, box.x2);
   float minimum_target_y = std::max(0.0F, box.y1);
   float maximum_target_y = std::min(config_.model_height, box.y2);
-  if (locked_candidate_.source == AimSource::head) {
+  if (control_candidate.source == AimSource::head) {
     const float width = box.x2 - box.x1;
     const float height = box.y2 - box.y1;
     const float inset_x = std::min(width * 0.45F,
@@ -1821,25 +1893,25 @@ MobileControlOutput MobileControlCore::active_output(
         config_.head_max_anchor_lag_pixels,
         height * config_.head_max_anchor_lag_fraction);
     minimum_target_x = std::max(
-        minimum_target_x, locked_candidate_.anchor_x - maximum_lag_x);
+        minimum_target_x, control_candidate.anchor_x - maximum_lag_x);
     maximum_target_x = std::min(
-        maximum_target_x, locked_candidate_.anchor_x + maximum_lag_x);
+        maximum_target_x, control_candidate.anchor_x + maximum_lag_x);
     minimum_target_y = std::max(
-        minimum_target_y, locked_candidate_.anchor_y - maximum_lag_y);
+        minimum_target_y, control_candidate.anchor_y - maximum_lag_y);
     maximum_target_y = std::min(
-        maximum_target_y, locked_candidate_.anchor_y + maximum_lag_y);
+        maximum_target_y, control_candidate.anchor_y + maximum_lag_y);
     if (minimum_target_x > maximum_target_x) {
       minimum_target_x = maximum_target_x = std::clamp(
-          locked_candidate_.anchor_x, box.x1 + inset_x, box.x2 - inset_x);
+          control_candidate.anchor_x, box.x1 + inset_x, box.x2 - inset_x);
     }
     if (minimum_target_y > maximum_target_y) {
       minimum_target_y = maximum_target_y = std::clamp(
-          locked_candidate_.anchor_y, box.y1 + inset_y, box.y2 - inset_y);
+          control_candidate.anchor_y, box.y1 + inset_y, box.y2 - inset_y);
     }
   }
   const float safe_radius = std::max(
       config_.motion.settle_minimum_radius_pixels,
-      locked_candidate_.safe_radius_pixels);
+      control_candidate.safe_radius_pixels);
   const float raw_error_x = target_x - config_.model_center_x;
   const float raw_error_y = target_y - config_.model_center_y;
   // Reserve a conservative response while sensitivity has no independent
@@ -1867,14 +1939,17 @@ MobileControlOutput MobileControlCore::active_output(
       .now_us = frame.now_us,
       .error_x = error_x,
       .error_y = error_y,
-      .target_velocity_x_pixels_per_second = can_predict_x ? velocity_x_ : 0.0F,
-      .target_velocity_y_pixels_per_second = can_predict_y ? velocity_y_ : 0.0F,
+      .target_velocity_x_pixels_per_second = can_predict_x && !provisional ? velocity_x_ : 0.0F,
+      .target_velocity_y_pixels_per_second = can_predict_y && !provisional ? velocity_y_ : 0.0F,
       .safe_radius_pixels = safe_radius,
       .prediction_bounds_enabled = true,
       .prediction_min_error_x = minimum_target_x - config_.model_center_x - compensation_x,
       .prediction_max_error_x = maximum_target_x - config_.model_center_x - compensation_x,
       .prediction_min_error_y = minimum_target_y - config_.model_center_y - compensation_y,
       .prediction_max_error_y = maximum_target_y - config_.model_center_y - compensation_y,
+      .stationary_x_evidence = !provisional && stationary_x_evidence_,
+      .stationary_y_evidence = !provisional && stationary_y_evidence_,
+      .no_pending_reports = pending_prediction_.reports==0U,
   };
   MobileMotionPlannerOutput motion{};
   if (config_.observation_servo_enabled) {
@@ -1903,7 +1978,8 @@ MobileControlOutput MobileControlCore::active_output(
   MobileControlOutput output{
       .has_target = true,
       .switched = switched,
-      .source = locked_candidate_.source,
+      .position_provisional = provisional!=nullptr,
+      .source = control_candidate.source,
       .suppression_reason =
           control_suppression_reason(motion.suppression_reason),
       .target_x = target_x,
@@ -1911,7 +1987,7 @@ MobileControlOutput MobileControlCore::active_output(
       .delta_x = motion.delta_x,
       .delta_y = motion.delta_y,
       .lock_id = lock_id_,
-      .track_id = locked_candidate_.track_id,
+      .track_id = control_candidate.track_id,
       .motion_phase = motion.phase,
       .motion_suppression_reason = motion.suppression_reason,
       .predicted_error_x = motion.predicted_error_x,
@@ -1928,27 +2004,27 @@ MobileControlOutput MobileControlCore::active_output(
       .pursuit_boosted_y = motion.pursuit_boosted_y,
       .settle_stopped = motion.settle_stopped,
       .head_safe_radius_pixels =
-          locked_candidate_.source == AimSource::head ||
-                  locked_candidate_.source == AimSource::geometric_head
+          control_candidate.source == AimSource::head ||
+                  control_candidate.source == AimSource::geometric_head
               ? safe_radius
               : 0.0F,
       .head_anchor_lag_x_pixels =
-          locked_candidate_.source == AimSource::head ||
-                  locked_candidate_.source == AimSource::geometric_head
+          control_candidate.source == AimSource::head ||
+                  control_candidate.source == AimSource::geometric_head
           ? std::fabs(
                 motion.predicted_error_x + config_.model_center_x -
-                locked_candidate_.anchor_x)
+                control_candidate.anchor_x)
           : 0.0F,
       .head_anchor_lag_y_pixels =
-          locked_candidate_.source == AimSource::head ||
-                  locked_candidate_.source == AimSource::geometric_head
+          control_candidate.source == AimSource::head ||
+                  control_candidate.source == AimSource::geometric_head
           ? std::fabs(
                 motion.predicted_error_y + config_.model_center_y -
-                locked_candidate_.anchor_y)
+                control_candidate.anchor_y)
           : 0.0F,
   };
   if (config_.observation_servo_enabled) {
-    const auto bounded = [&](int delta, float pending, bool trusted, float raw_error) {
+    const auto bounded = [&](int delta, float pending_minimum, float pending_maximum, bool trusted, float raw_error) {
       const int budget = trusted ? 128 : 64;
       const bool far_and_clear = std::fabs(raw_error) > 80.F && pending_prediction_.reports < 2U;
       if (delta != 0 && !far_and_clear) {
@@ -1962,10 +2038,12 @@ MobileControlOutput MobileControlCore::active_output(
         if (delta > share) delta = share;
         else if (delta < -share) delta = -share;
       }
-      return MobilePendingMotion::bound_axis(delta, pending, budget);
+      return MobilePendingMotion::bound_axis(delta,pending_minimum,pending_maximum,budget);
     };
-    output.delta_x = bounded(output.delta_x, pending_prediction_.x, response_estimator_.x().trusted, raw_error_x);
-    output.delta_y = bounded(output.delta_y, pending_prediction_.y, response_estimator_.y().trusted, raw_error_y);
+    output.delta_x = bounded(output.delta_x,pending_prediction_.minimum_x,pending_prediction_.maximum_x,
+        response_estimator_.x().trusted,raw_error_x);
+    output.delta_y = bounded(output.delta_y,pending_prediction_.minimum_y,pending_prediction_.maximum_y,
+        response_estimator_.y().trusted,raw_error_y);
     if (motion.has_move() && !output.has_move()) {
       ++metrics_.pending_motion_budget_holds;
       output.suppression_reason = ControlSuppressionReason::response_guard;
@@ -1974,8 +2052,8 @@ MobileControlOutput MobileControlCore::active_output(
     output.pending_motion_y = pending_y;
     output.pending_motion_reports = pending_prediction_.reports;
   }
-  if (locked_candidate_.source == AimSource::head ||
-      locked_candidate_.source == AimSource::geometric_head) {
+  if (control_candidate.source == AimSource::head ||
+      control_candidate.source == AimSource::geometric_head) {
     metrics_.last_head_safe_radius_pixels = safe_radius;
     metrics_.maximum_head_anchor_lag_pixels = std::max({
         metrics_.maximum_head_anchor_lag_pixels,
@@ -2075,7 +2153,9 @@ void MobileControlCore::record_control_trace(
           (crowd_identity_hold_ ? 16U : 0U) | (alternative && alternative->track_was_known ? 32U : 0U) |
           (diagnostic_image_rebind_ ? 64U : 0U) | (image_rebind_track_ ? 128U : 0U) |
           (fresh_encounter_armed_ ? 256U : 0U) | (diagnostic_fast_acquisition_ ? 512U : 0U) |
-          (diagnostic_exited_lock_ ? 1024U : 0U) | (pending_switch_fast_ ? 2048U : 0U),
+          (diagnostic_exited_lock_ ? 1024U : 0U) | (pending_switch_fast_ ? 2048U : 0U) |
+          (output.position_provisional ? 4096U : 0U) |
+          (known_neighbours_.incomplete() ? 8192U : 0U),
       .velocity_flags = diagnostic_velocity_flags_,
       .motion_flags = (diagnostic_servo_evaluated_ ? 1U : 0U) | (output.prediction_limited ? 2U : 0U) |
           (output.response_limited ? 4U : 0U) |
@@ -2107,6 +2187,7 @@ void MobileControlCore::record_control_trace(
 }
 
 void MobileControlCore::prepare_feedback_frame(const ControlFrameContext& frame) noexcept {
+  stationary_x_evidence_=stationary_y_evidence_=false;
   association_shift_this_frame_ = false;
   known_owner_resolved_this_frame_ = false;
   retinal_velocity_constrained_x_=retinal_velocity_constrained_y_=false;
@@ -2137,7 +2218,9 @@ void MobileControlCore::prepare_feedback_frame(const ControlFrameContext& frame)
   config_.motion.response_y_px_per_count = response_estimator_.y().response;
   motion_planner_.update_response_estimate(config_.motion.response_x_px_per_count,
                                           config_.motion.response_y_px_per_count);
-  pending_prediction_ = pending_motion_.predict(frame.observed_at_us, response_estimator_.delay_us());
+  const auto& delay_range=response_estimator_.delay_range();
+  pending_prediction_ = pending_motion_.predict(frame.observed_at_us,response_estimator_.delay_us(),
+      delay_range.minimum_us,delay_range.maximum_us);
   if (background_valid_this_frame_) {
     apply_visible_frame_shift(frame.background.x, frame.background.y, true, frame.background.support);
     ++metrics_.background_motion_frames;
@@ -2187,6 +2270,9 @@ MobileControlOutput MobileControlCore::process_impl(
   }
 
   if (refresh_locked_candidate(frame)) {
+    if (position_spike_held_) {
+      return provisional_output(frame);
+    }
     record_image_owner_evidence(image_motion,frame);
     clear_image_identity_pending();
     return active_output(frame, false);
@@ -2219,7 +2305,7 @@ MobileControlOutput MobileControlCore::process_impl(
     Candidate visible{};
     Candidate crowd{};
     bool crowd_ready = false;
-    if (config_.observation_servo_enabled && has_lock_ && !crowd_identity_hold_ &&
+    if (!known_neighbours_.incomplete() && config_.observation_servo_enabled && has_lock_ && !crowd_identity_hold_ &&
         candidates_.size() >= 2U) {
       const Candidate* best = nullptr;
       float best_distance = 0.F;
@@ -2264,7 +2350,7 @@ MobileControlOutput MobileControlCore::process_impl(
       if (!has_pending_switch_ || continued) {
         ++missing_frames_;
         const bool confirmed = update_pending_switch(visible, frame.observed_at_us);
-        const bool paired = continued && pending_switch_frames_ >= 2U &&
+        const bool paired = unique_ready && visible.stranger_eligible && continued && pending_switch_frames_ >= 2U &&
             frame.observed_at_us >= pending_switch_started_at_us_ + 8'000U &&
             feedback_frame_interval_us_ <= kContinuousControlMaximumObservationAgeUs;
         if (confirmed || paired) {
@@ -2396,9 +2482,11 @@ ControlSuppressionReason MobileControlCore::observe_tracking_only(
     return ControlSuppressionReason::response_guard;
   }
   if (refresh_locked_candidate(frame)) {
-    record_image_owner_evidence(image_motion,frame);
-    clear_image_identity_pending();
-    ++metrics_.tracking_only_lock_updates;
+    if (!position_spike_held_) {
+      record_image_owner_evidence(image_motion,frame);
+      clear_image_identity_pending();
+      ++metrics_.tracking_only_lock_updates;
+    }
   } else if(refresh_image_identity(image_motion,frame)) {
     ++metrics_.tracking_only_lock_updates;
   }
@@ -2458,7 +2546,8 @@ void MobileControlCore::reset() noexcept {
   paired_body_for_head_.clear();
   paired_bodies_.clear();
   tracker_.reset();
-  known_track_id_ceiling_ = 0U;
+  known_neighbours_.clear();
+  seen_track_frontier_=owner_seen_frontier_=0U;
   locked_candidate_ = {};
   has_lock_ = false;
   reacquisition_requires_confirmation_ = false;

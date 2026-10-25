@@ -43,6 +43,7 @@ public:
       if (recent.x_valid && recent.x == 0.F) {
         if (result.x != 0.F) retired_axes_ |= 1U;
         result.x=0.F; result.x_valid=true;
+        result.x_stationary=recent.x_stationary;
         result.x_proposal_limited=recent.x_proposal_limited;
         result.x_evidence=recent.x_evidence;
         result.x_evidence.window=MobileResponseEstimator::DisturbanceWindow::recent_four;
@@ -50,6 +51,7 @@ public:
       if (recent.y_valid && recent.y == 0.F) {
         if (result.y != 0.F) retired_axes_ |= 2U;
         result.y=0.F; result.y_valid=true;
+        result.y_stationary=recent.y_stationary;
         result.y_proposal_limited=recent.y_proposal_limited;
         result.y_evidence=recent.y_evidence;
         result.y_evidence.window=MobileResponseEstimator::DisturbanceWindow::recent_four;
@@ -97,10 +99,12 @@ public:
       if (changing_x) retire(result.x,control.x,control.x_valid,1U);
       if (changing_y) retire(result.y,control.y,control.y_valid,2U);
       if (geometry_bounded_axes_ & 1U) {
+        result.x_stationary=control.x_stationary;
         result.x_evidence=control.x_evidence;
         result.x_evidence.window=MobileResponseEstimator::DisturbanceWindow::control_point;
       }
       if (geometry_bounded_axes_ & 2U) {
+        result.y_stationary=control.y_stationary;
         result.y_evidence=control.y_evidence;
         result.y_evidence.window=MobileResponseEstimator::DisturbanceWindow::control_point;
       }
