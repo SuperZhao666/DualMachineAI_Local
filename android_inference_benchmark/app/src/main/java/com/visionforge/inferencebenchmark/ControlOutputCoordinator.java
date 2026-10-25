@@ -33,6 +33,15 @@ final class ControlOutputCoordinator {
     private boolean automaticRetryDeferred;
     private boolean outputCloseConfirmed;
     private boolean disposed;
+    private static final java.util.concurrent.atomic.AtomicLong AUTHORITY_SEQUENCE = new java.util.concurrent.atomic.AtomicLong();
+    private long authorizationRevision=AUTHORITY_SEQUENCE.incrementAndGet();
+    synchronized long authorizationRevision() { return authorizationRevision; }
+    synchronized boolean reconcileAtRevision(long expected,boolean healthy,boolean known,
+            boolean requested,boolean effective,boolean suspended) {
+        if(disposed || expected!=authorizationRevision)return false;
+        reconcileAutomaticState(healthy,known,requested,effective,suspended);return true;
+    }
+    private void advanceAuthorizationRevision() { authorizationRevision=AUTHORITY_SEQUENCE.incrementAndGet(); }
     private final Set<String> lockReasonsReportedWhileClosed = new HashSet<>();
     private long lastUsbWriteCompletions;
     private long lastDeliveryFailures;
@@ -131,6 +140,7 @@ final class ControlOutputCoordinator {
                 return;
             }
             if (!outputRecoverySuspended) {
+                advanceAuthorizationRevision();
                 events.write("control_output_recovery_suspended",
                         "automatic_request=true output_effective=false fail_closed=true");
             }
@@ -139,6 +149,7 @@ final class ControlOutputCoordinator {
             return;
         }
         if (nativeRequested && nativeEffective) {
+            if (!outputEnabled || outputRecoverySuspended) advanceAuthorizationRevision();
             if (outputRecoverySuspended) {
                 events.write("control_output_recovery_resumed",
                         "automatic_request=true output_effective=true");
@@ -157,6 +168,7 @@ final class ControlOutputCoordinator {
                 || outputTransport.deliveryState().circuitOpen) return;
         // A partial enable must execute a fresh close; the previously
         // confirmed disabled state no longer describes the native gate.
+        advanceAuthorizationRevision();
         outputCloseConfirmed = false;
         if (!profile.apply(true)) {
             closeAutomaticGate("native_profile_rejected");
@@ -192,6 +204,7 @@ final class ControlOutputCoordinator {
 
     synchronized void disable() {
         if (disposed) return;
+        advanceAuthorizationRevision();
         runtimeHealthy = false;
         closeAutomaticGate("runtime_stopped");
     }
@@ -201,6 +214,7 @@ final class ControlOutputCoordinator {
         // Invalidate already captured listeners before closing shared native
         // state. Unregistering cannot recall a callback outside core's lock.
         disposed = true;
+        advanceAuthorizationRevision();
         runtimeHealthy = false;
         closeAutomaticGate("runtime_stopped");
         outputTransport.setReconnectListener(null);
@@ -209,8 +223,17 @@ final class ControlOutputCoordinator {
 
     synchronized void failClosed(String reason) {
         if (disposed) return;
+        advanceAuthorizationRevision();
         runtimeHealthy = false;
         closeAutomaticGate(reason);
+    }
+
+    /** Repeated absence of a health report is the same closed state, rather
+     * than a new user revocation that invalidates a sample still being read. */
+    synchronized void failClosedForMissingHealth(String reason) {
+        if(disposed)return;
+        if(runtimeHealthy)advanceAuthorizationRevision();
+        runtimeHealthy=false;closeAutomaticGate(reason);
     }
 
     private void closeAutomaticGate(String reason) {
@@ -236,6 +259,7 @@ final class ControlOutputCoordinator {
     }
 
     private void closeEffectiveOutput() {
+        advanceAuthorizationRevision();
         outputEnabled = false;
         outputRecoverySuspended = false;
         usbWriteCompletedSinceEnable = false;
@@ -455,6 +479,7 @@ final class ControlOutputCoordinator {
     }
 
     private boolean reconfigureActiveProfile() {
+        advanceAuthorizationRevision();
         outputEnabled = false;
         usbWriteCompletedSinceEnable = false;
         outputCloseConfirmed = false;
@@ -471,6 +496,7 @@ final class ControlOutputCoordinator {
     }
 
     private boolean applyDisabledProfile() {
+        advanceAuthorizationRevision();
         boolean applied = profile.apply(false);
         if (!applied) outputCloseConfirmed = false;
         return applied;

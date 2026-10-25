@@ -135,7 +135,7 @@ final class QnnAssetBundleInstaller {
         for (String name : names) {
             MessageDigest digest = sha256();
             long size = 0L;
-            try (InputStream input = source.open(name)) {
+            try (InputStream input = MobilePackagedAssetException.open(name,()->source.open(name))) {
                 int read;
                 while ((read = input.read(buffer)) != -1) {
                     requireNotInterrupted();
@@ -156,7 +156,7 @@ final class QnnAssetBundleInstaller {
         Files.deleteIfExists(temporary.toPath());
         MessageDigest digest = sha256();
         long copied = 0L;
-        try (InputStream input = source.open(descriptor.name);
+        try (InputStream input = MobilePackagedAssetException.open(descriptor.name,()->source.open(descriptor.name));
              FileOutputStream output = new FileOutputStream(temporary)) {
             byte[] buffer = new byte[COPY_BUFFER_BYTES];
             int read;

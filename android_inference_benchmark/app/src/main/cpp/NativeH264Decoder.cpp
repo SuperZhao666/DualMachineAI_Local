@@ -252,6 +252,7 @@ void NativeH264Decoder::bind_java_decoder(JNIEnv* environment, jobject decoder) 
   java_restart_after_discontinuity_method_ = restart;
   java_input_health_report_method_ = input_health;
   ++java_decoder_binding_generation_;
+  java_callback_ownership_.reset();
 }
 
 bool NativeH264Decoder::submit(
@@ -1364,8 +1365,9 @@ bool NativeH264Decoder::process_java_yuv420(
 
 void NativeH264Decoder::update_java_decoder_format(
     std::string codec_name, std::int32_t color_format, std::int32_t color_standard,
-    std::int32_t color_range, std::int32_t width, std::int32_t height) {
+    std::int32_t color_range, std::int32_t width, std::int32_t height,std::optional<DecoderCallbackToken> token) {
   std::scoped_lock lock(mutex_);
+  if(!token || !java_callback_ownership_.accepts(*token,java_decoder_binding_generation_,stream_restart_generation_,java_image_decoder_mode_))return;
   java_decoder_name_ = std::move(codec_name);
   output_color_format_ = color_format;
   output_color_standard_ = color_standard;
@@ -1379,9 +1381,20 @@ bool NativeH264Decoder::has_fatal_decoder_failure() const {
   return java_decoder_failed_;
 }
 
-void NativeH264Decoder::discard_java_decoded_output(
-    std::int64_t presentation_time_us, std::string reason, bool fatal) {
+std::array<std::uint64_t,2> NativeH264Decoder::java_callback_context() const {
   std::scoped_lock lock(mutex_);
+  return java_image_decoder_mode_?std::array<std::uint64_t,2>{java_decoder_binding_generation_,stream_restart_generation_}:
+      std::array<std::uint64_t,2>{};
+}
+bool NativeH264Decoder::publish_java_codec(DecoderCallbackToken token) {
+  std::scoped_lock lock(mutex_);
+  return java_callback_ownership_.publish(token,java_decoder_binding_generation_,stream_restart_generation_,java_image_decoder_mode_);
+}
+
+void NativeH264Decoder::discard_java_decoded_output(
+    std::int64_t presentation_time_us, std::string reason, bool fatal,std::optional<DecoderCallbackToken> token) {
+  std::scoped_lock lock(mutex_);
+  if((fatal && !token) || (token && !java_callback_ownership_.accepts(*token,java_decoder_binding_generation_,stream_restart_generation_,java_image_decoder_mode_)))return;
   if(const auto frame=take_pending_frame_for_output_locked(presentation_time_us))
     record_outcome(*frame,PipelineOutcome::decoded_discarded,fatal?1U:0U);
   ++rejected_output_images_;
@@ -1413,8 +1426,9 @@ void NativeH264Decoder::coalesce_java_decoded_output(std::int64_t older_us, std:
 }
 
 void NativeH264Decoder::discard_java_compressed_access_unit(
-    std::int64_t presentation_time_us, std::string reason, bool fatal) {
+    std::int64_t presentation_time_us, std::string reason, bool fatal,std::optional<DecoderCallbackToken> token) {
   std::scoped_lock lock(mutex_);
+  if((fatal && !token) || (token && !java_callback_ownership_.accepts(*token,java_decoder_binding_generation_,stream_restart_generation_,java_image_decoder_mode_)))return;
   if(const auto frame=take_pending_frame_for_output_locked(presentation_time_us))
     record_outcome(*frame,PipelineOutcome::compressed_discarded,fatal?1U:0U);
   ++dropped_access_units_;
@@ -1563,6 +1577,9 @@ void NativeH264Decoder::complete_stream_restart(
   }
   stream_restart_in_progress_ = false;
   last_stream_restart_us_ = elapsed_us;
+  // Current codec failure is newer evidence than its publication success.
+  const bool current_codec_failed=java_decoder_failed_;
+  succeeded=succeeded && !current_codec_failed;
   pending_stream_restart_completion_ = StreamRestartCompletion{
       generation, succeeded, elapsed_us};
   if (succeeded) {
@@ -1573,8 +1590,9 @@ void NativeH264Decoder::complete_stream_restart(
   } else {
     ++stream_restart_failures_;
     java_decoder_failed_ = true;
-    java_decoder_failure_ = diagnostic.empty()
-        ? "stream_source_changed_restart_failed" : std::move(diagnostic);
+    if(!current_codec_failed || java_decoder_failure_.empty())
+      java_decoder_failure_ = diagnostic.empty()
+          ? "stream_source_changed_restart_failed" : std::move(diagnostic);
     pending_makcu_resume_generation_.reset();
     disable_makcu_output();
   }
@@ -1999,6 +2017,40 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_visionforge_inferencebenchmark_QnnHtpBridge_coalesceNativeDecodedOutput(
     JNIEnv*, jclass, jlong older_us, jlong newer_us) {
   vfdual_android::decoder().coalesce_java_decoded_output(older_us, newer_us);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_getNativeH264CallbackContext(JNIEnv* env,jclass) {
+  const auto context=vfdual_android::decoder().java_callback_context();
+  const jlong values[]{static_cast<jlong>(context[0]),static_cast<jlong>(context[1])};
+  auto result=env->NewLongArray(2);if(result)env->SetLongArrayRegion(result,0,2,values);return result;
+}
+static vfdual_android::DecoderCallbackToken callback_token(jlong binding,jlong stream,jlong codec) {
+  return {binding>0?static_cast<std::uint64_t>(binding):0U,stream>0?static_cast<std::uint64_t>(stream):0U,
+      codec>0?static_cast<std::uint64_t>(codec):0U};
+}
+static std::string callback_text(JNIEnv* env,jstring text) {
+  const char* utf=text?env->GetStringUTFChars(text,nullptr):nullptr;
+  std::string result=utf?utf:"unknown";if(utf)env->ReleaseStringUTFChars(text,utf);return result;
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_publishNativeH264Codec(JNIEnv*,jclass,jlong binding,jlong stream,jlong codec) {
+  return vfdual_android::decoder().publish_java_codec(callback_token(binding,stream,codec))?JNI_TRUE:JNI_FALSE;
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_discardNativeDecodedOutputAtGeneration(
+    JNIEnv* env,jclass,jlong pts,jstring reason,jboolean fatal,jlong binding,jlong stream,jlong codec) {
+  vfdual_android::decoder().discard_java_decoded_output(pts,callback_text(env,reason),fatal==JNI_TRUE,callback_token(binding,stream,codec));
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_discardNativeCompressedAccessUnitAtGeneration(
+    JNIEnv* env,jclass,jlong pts,jstring reason,jboolean fatal,jlong binding,jlong stream,jlong codec) {
+  vfdual_android::decoder().discard_java_compressed_access_unit(pts,callback_text(env,reason),fatal==JNI_TRUE,callback_token(binding,stream,codec));
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_updateNativeH264JavaDecoderFormatAtGeneration(
+    JNIEnv* env,jclass,jstring name,jint format,jint standard,jint range,jint width,jint height,jlong binding,jlong stream,jlong codec) {
+  vfdual_android::decoder().update_java_decoder_format(callback_text(env,name),format,standard,range,width,height,callback_token(binding,stream,codec));
 }
 
 extern "C" JNIEXPORT void JNICALL

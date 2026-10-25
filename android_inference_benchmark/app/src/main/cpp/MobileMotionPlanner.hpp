@@ -133,6 +133,9 @@ struct MobileMotionPlannerInput {
   // Explicit current evidence, not an unknown velocity represented by zero.
   bool stationary_x_evidence{}, stationary_y_evidence{};
   bool no_pending_reports{};
+  // Independent-axis risk absence. The legacy all-axes flag above remains a
+  // conservative compatibility path for callers that know both axes are clear.
+  bool no_pending_x_reports{},no_pending_y_reports{};
 };
 
 struct MobileMotionPlannerOutput {

@@ -82,7 +82,7 @@ class MobileContinuousServo final {
     output.phase = std::hypot(in.error_x, in.error_y) < 3.0F ? MobileMotionPhase::settle : MobileMotionPhase::pursuit;
     const auto axis = [&](float raw_error, float velocity, float response,
                           float pending, bool trusted, float minimum_error, float maximum_error,
-                          bool stationary_evidence,
+                          bool stationary_evidence,bool no_pending_axis,
                           Axis& state, float& predicted, bool& pursuit_boosted, AxisDiagnostic& diagnostic) {
       const float bounded_velocity = std::clamp(velocity, -config.maximum_target_velocity_pixels_per_second,
                                                          config.maximum_target_velocity_pixels_per_second);
@@ -126,7 +126,7 @@ class MobileContinuousServo final {
       const float radius = std::max(config.deadzone_pixels, .5F * response);
       diagnostic.resolution_radius = radius;
       const float numerical_hysteresis = std::max(.0001F, radius * .00001F);
-      if (!confirmed_stationary || !in.no_pending_reports ||
+      if (!confirmed_stationary || !no_pending_axis ||
           std::abs(raw_error) > radius + (state.resolution_stopped ? numerical_hysteresis : 0.F)) {
         state.resolution_stopped = false;
       } else {
@@ -174,11 +174,13 @@ class MobileContinuousServo final {
     output.delta_x = axis(in.error_x, in.target_velocity_x_pixels_per_second,
         config.response_x_px_per_count, pending_x, trusted_x,
         in.prediction_min_error_x, in.prediction_max_error_x, in.stationary_x_evidence,
+        in.no_pending_reports || in.no_pending_x_reports,
         x_, output.predicted_error_x,
         output.pursuit_boosted_x, diagnostic_.x);
     output.delta_y = axis(in.error_y, in.target_velocity_y_pixels_per_second,
         config.response_y_px_per_count, pending_y, trusted_y,
         in.prediction_min_error_y, in.prediction_max_error_y, in.stationary_y_evidence,
+        in.no_pending_reports || in.no_pending_y_reports,
         y_, output.predicted_error_y,
         output.pursuit_boosted_y, diagnostic_.y);
     if (!output.has_move()) output.suppression_reason =

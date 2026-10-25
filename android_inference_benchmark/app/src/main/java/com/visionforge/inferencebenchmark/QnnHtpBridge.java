@@ -1,6 +1,7 @@
 package com.visionforge.inferencebenchmark;
 
 final class QnnHtpBridge {
+    static native boolean claimNativeUnstartedWirelessVideoReceiver(String localIpv4,String expectedHostIpv4,long networkHandle);
     static {
         System.loadLibrary("visionforge_qnn_htp");
     }
@@ -72,6 +73,12 @@ final class QnnHtpBridge {
 
     static native void discardNativeDecodedOutput(
             long presentationTimeUs, String reason, boolean fatal);
+    static native long[] getNativeH264CallbackContext();
+    static native boolean publishNativeH264Codec(long binding,long stream,long codec);
+    static native void discardNativeDecodedOutputAtGeneration(long pts,String reason,boolean fatal,long binding,long stream,long codec);
+    static native void discardNativeCompressedAccessUnitAtGeneration(long pts,String reason,boolean fatal,long binding,long stream,long codec);
+    static native void updateNativeH264JavaDecoderFormatAtGeneration(String name,int format,int standard,int range,int width,int height,
+            long binding,long stream,long codec);
 
     /** Preserve an unconsumed fresh observation when a newer repeat replaces it. */
     static native void coalesceNativeDecodedOutput(long olderTimeUs, long newerTimeUs);

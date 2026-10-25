@@ -364,9 +364,24 @@ class MobileControlCore final {
     return true;
   }
   [[nodiscard]] const MobileResponseEstimator& response_estimator() const noexcept { return response_estimator_; }
+  [[nodiscard]] VelocityHistoryState target_velocity_history_state()const noexcept {return target_velocity_.state();}
+  [[nodiscard]] VelocityHistoryState disturbance_velocity_history_state()const noexcept {return disturbance_velocity_.state();}
+  [[nodiscard]] unsigned target_velocity_history_points()const noexcept {return target_velocity_.sample_count();}
+  [[nodiscard]] unsigned disturbance_velocity_history_points()const noexcept {return disturbance_velocity_.sample_count();}
+  [[nodiscard]] std::uint64_t target_velocity_history_span_us()const noexcept {return target_velocity_.span_us();}
+  [[nodiscard]] std::uint64_t disturbance_velocity_history_span_us()const noexcept {return disturbance_velocity_.span_us();}
+  [[nodiscard]] std::uint32_t pending_x_risk_reports()const noexcept {return pending_prediction_.reports_x;}
+  [[nodiscard]] std::uint32_t pending_y_risk_reports()const noexcept {return pending_prediction_.reports_y;}
   [[nodiscard]] bool restore_response_calibration(float x, float y, std::uint64_t delay, float qx, float qy) noexcept {
     if (last_accepted_at_us_ != 0 || !response_estimator_.restore(x,y,delay,qx,qy)) return false;
     config_.motion.response_x_px_per_count=x; config_.motion.response_y_px_per_count=y;
+    return true;
+  }
+  [[nodiscard]] bool restore_runtime_response_calibration(
+      const MobileResponseEstimator::RuntimeCalibration& saved) noexcept {
+    if(last_accepted_at_us_ || !response_estimator_.restore_runtime_calibration(saved))return false;
+    config_.motion.response_x_px_per_count=saved.x.response;
+    config_.motion.response_y_px_per_count=saved.y.response;
     return true;
   }
   [[nodiscard]] const ControlTrace& control_trace() const noexcept { return control_trace_; }
@@ -556,6 +571,7 @@ class MobileControlCore final {
   std::uint64_t last_geometry_observed_at_us_{};
   std::uint64_t quiet_background_since_us_{};
   std::uint64_t feedback_frame_interval_us_{};
+  std::uint64_t feedback_previous_observed_at_us_{};
   bool background_valid_this_frame_{};
   bool stationary_x_evidence_{},stationary_y_evidence_{};
   bool retinal_velocity_constrained_x_{},retinal_velocity_constrained_y_{};

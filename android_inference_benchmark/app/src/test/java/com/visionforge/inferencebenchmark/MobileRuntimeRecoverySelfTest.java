@@ -44,8 +44,10 @@ final class MobileRuntimeRecoverySelfTest {
         require(unavailable.candidates.length == 0);
         require(new MobileInferenceFailurePolicy.Accumulator().resolve().disposition
                 == MobilePipelineCoordinator.FailureDisposition.TERMINAL_INCOMPATIBLE);
-        require(MobileInferencePreparationAssets.failure("package missing", new FileNotFoundException())
+        require(MobileInferencePreparationAssets.failure("package missing", new MobilePackagedAssetException("asset",new FileNotFoundException()))
                 .disposition == MobilePipelineCoordinator.FailureDisposition.TERMINAL_INCOMPATIBLE);
+        require(MobileInferencePreparationAssets.failure("local output open",new FileNotFoundException())
+                .disposition==MobilePipelineCoordinator.FailureDisposition.RETRYABLE);
         require(MobileInferencePreparationAssets.failure("temporary disk I/O", new IOException())
                 .disposition == MobilePipelineCoordinator.FailureDisposition.RETRYABLE);
         require(MobileInferencePreparationAssets.failure("package integrity", new MobilePackagedAssetException("hash"))

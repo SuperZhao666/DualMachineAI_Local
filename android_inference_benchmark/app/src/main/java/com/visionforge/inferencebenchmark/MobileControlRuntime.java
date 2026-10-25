@@ -200,24 +200,38 @@ final class MobileControlRuntime {
             boolean nativeRequested,
             boolean nativeEffective,
             boolean nativeRecoverySuspended) {
-        if (destroyed) return;
+        reconcileAtRevision(output.authorizationRevision(),runtimeHealthy,nativeStateKnown,
+                nativeRequested,nativeEffective,nativeRecoverySuspended);
+    }
+
+    synchronized long authorizationRevision() { return destroyed?-1:output.authorizationRevision(); }
+    synchronized boolean reconcileAtRevision(long expected,boolean runtimeHealthy,boolean nativeStateKnown,
+            boolean nativeRequested,boolean nativeEffective,boolean nativeRecoverySuspended) {
+        if (destroyed) return false;
         if (activeRoute == ControlOutputRoute.BLUETOOTH_HID) {
             cat6ButtonInput.updateEndpoint(transportEndpoint);
         }
         output.reconcileDeliveryState();
-        output.reconcileAutomaticState(
+        boolean applied=output.reconcileAtRevision(expected,
                 runtimeHealthy && inference.isNativeConfigurationApplied(),
                 nativeStateKnown,
                 nativeRequested,
                 nativeEffective,
                 nativeRecoverySuspended);
         if (runtimeHealthy && output.isOutputEnabled()) lastFailClosedReason = "";
+        return applied;
     }
 
     synchronized void failClosed(String reason) {
+        failClosedInternal(reason,false);
+    }
+    synchronized void failClosedForMissingHealth(String reason) {
+        failClosedInternal(reason,true);
+    }
+    private void failClosedInternal(String reason,boolean missingHealth) {
         if (destroyed) return;
         String reasonToken = reportToken(reason);
-        output.failClosed(reasonToken);
+        if(missingHealth)output.failClosedForMissingHealth(reasonToken);else output.failClosed(reasonToken);
         if (!reasonToken.equals(lastFailClosedReason)) {
             events.write("mobile_control_runtime_fail_closed",
                     "reason=" + reasonToken + " automatic_retry=true");

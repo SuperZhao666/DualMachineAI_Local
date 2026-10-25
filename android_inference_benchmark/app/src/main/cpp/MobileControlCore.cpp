@@ -1526,6 +1526,14 @@ void MobileControlCore::accept_candidate(
       }
       const bool trusted_x = response_estimator_.x().trusted;
       const bool trusted_y = response_estimator_.y().trusted;
+      const bool velocity_frame_fresh=frame.now_us-frame.observed_at_us<kContinuousControlMaximumObservationAgeUs;
+      const auto adjacent_previous=background_valid_this_frame_?frame.background.previous_observed_at_us:0U;
+      if(!velocity_frame_fresh) {
+        target_velocity_.reset(VelocityHistoryState::stale_observation);
+        disturbance_velocity_.reset(VelocityHistoryState::stale_observation);
+      } else if(!background_valid_this_frame_) {
+        target_velocity_.reset(VelocityHistoryState::invalid_background);
+      }
       const bool stationary_geometry = background_valid_this_frame_ && frame.background.support>=16U &&
           !shape_discontinuity && candidates_.size()==1U && candidate.detection.confidence>=.75F &&
           box_size_compatible(locked_candidate_.detection,candidate.detection,.98F,1.02F);
@@ -1537,14 +1545,15 @@ void MobileControlCore::accept_candidate(
       stationary_y_evidence_=stationary_geometry && consecutive_geometry &&
           std::abs(control_displacement_y)<.001F;
       if (background_valid_this_frame_ || trusted_x || trusted_y) {
-        if (!background_valid_this_frame_) target_displacement_x = target_displacement_y = 0.0F;
-        const auto velocity = shape_discontinuity ? MobileTargetVelocity::Velocity{} :
+        const auto velocity = shape_discontinuity || !velocity_frame_fresh || !background_valid_this_frame_
+            ? MobileTargetVelocity::Velocity{} :
             target_velocity_.update(target_displacement_x, target_displacement_y,
-                last_target_observed_at_us_, frame.observed_at_us, config_.maximum_velocity_pixels_per_second);
+                last_target_observed_at_us_, frame.observed_at_us,
+                config_.maximum_velocity_pixels_per_second,adjacent_previous);
         velocity_x_ = velocity.x; velocity_y_ = velocity.y;
         diagnostic_proposal_x_ = velocity.x; diagnostic_proposal_y_ = velocity.y;
         diagnostic_velocity_flags_ |= 1U;
-        if (config_.model_based_motion_feedforward) {
+        if (config_.model_based_motion_feedforward && velocity_frame_fresh) {
           const auto disturbance = disturbance_velocity_.update(observed_x,observed_y,
               frame.observed_at_us,response_estimator_,config_.maximum_velocity_pixels_per_second,
               velocity.x,velocity.y,
@@ -1556,7 +1565,8 @@ void MobileControlCore::accept_candidate(
                   response_estimator_.delay_us()<=32'000U &&
                   pending_prediction_.reports==0 && background_valid_this_frame_ &&
                   quiet_background_since_us_ &&
-                  frame.observed_at_us-quiet_background_since_us_>=30'000U);
+                  frame.observed_at_us-quiet_background_since_us_>=30'000U,
+              feedback_previous_observed_at_us_);
           stationary_x_evidence_=stationary_geometry && (disturbance.x_stationary ||
               (consecutive_geometry && std::abs(control_displacement_x)<.001F));
           stationary_y_evidence_=stationary_geometry && (disturbance.y_stationary ||
@@ -1571,8 +1581,8 @@ void MobileControlCore::accept_candidate(
           // It is not an unconditional fallback for screen-relative velocity:
           // the estimator must first constrain it to the observed retinal/HID
           // interval. Insufficient history leaves position feedback active.
-          if (trusted_x) velocity_x_=disturbance.x_valid ? disturbance.x : 0.0F;
-          if (trusted_y) velocity_y_=disturbance.y_valid ? disturbance.y : 0.0F;
+          velocity_x_=trusted_x && disturbance.x_valid ? disturbance.x : 0.0F;
+          velocity_y_=trusted_y && disturbance.y_valid ? disturbance.y : 0.0F;
           retinal_velocity_constrained_x_=trusted_x && disturbance.x_proposal_limited;
           retinal_velocity_constrained_y_=trusted_y && disturbance.y_proposal_limited;
           metrics_.retinal_velocity_constraints_x+=retinal_velocity_constrained_x_;
@@ -1581,7 +1591,9 @@ void MobileControlCore::accept_candidate(
           metrics_.confirmed_stop_velocity_resets_y += (disturbance_velocity_.retired_axes() & 2U) != 0U;
         }
       } else {
-        target_velocity_.reset(); velocity_x_ = velocity_y_ = 0.0F;
+        target_velocity_.reset(VelocityHistoryState::invalid_background);
+        disturbance_velocity_.reset(VelocityHistoryState::invalid_background);
+        velocity_x_ = velocity_y_ = 0.0F;
       }
     }
   } else {
@@ -1950,6 +1962,8 @@ MobileControlOutput MobileControlCore::active_output(
       .stationary_x_evidence = !provisional && stationary_x_evidence_,
       .stationary_y_evidence = !provisional && stationary_y_evidence_,
       .no_pending_reports = pending_prediction_.reports==0U,
+      .no_pending_x_reports = pending_prediction_.reports_x==0U,
+      .no_pending_y_reports = pending_prediction_.reports_y==0U,
   };
   MobileMotionPlannerOutput motion{};
   if (config_.observation_servo_enabled) {
@@ -2156,7 +2170,9 @@ void MobileControlCore::record_control_trace(
           (diagnostic_exited_lock_ ? 1024U : 0U) | (pending_switch_fast_ ? 2048U : 0U) |
           (output.position_provisional ? 4096U : 0U) |
           (known_neighbours_.incomplete() ? 8192U : 0U),
-      .velocity_flags = diagnostic_velocity_flags_,
+      .velocity_flags = diagnostic_velocity_flags_ |
+          (static_cast<std::uint32_t>(target_velocity_.state())<<8U) |
+          (static_cast<std::uint32_t>(disturbance_velocity_.state())<<12U),
       .motion_flags = (diagnostic_servo_evaluated_ ? 1U : 0U) | (output.prediction_limited ? 2U : 0U) |
           (output.response_limited ? 4U : 0U) |
           (diagnostic_servo_evaluated_ && output.delta_x != continuous_servo_.last_output().delta_x ? 16U : 0U) |
@@ -2194,9 +2210,17 @@ void MobileControlCore::prepare_feedback_frame(const ControlFrameContext& frame)
   body_shape_motion_reset_this_frame_ = false;
   diagnostic_fast_acquisition_ = diagnostic_exited_lock_ = false;
   if (!config_.observation_servo_enabled) return;
+  feedback_previous_observed_at_us_=last_geometry_observed_at_us_;
   feedback_frame_interval_us_ = last_geometry_observed_at_us_ &&
       frame.observed_at_us > last_geometry_observed_at_us_
       ? frame.observed_at_us - last_geometry_observed_at_us_ : 0U;
+  if(frame.now_us-frame.observed_at_us>=kContinuousControlMaximumObservationAgeUs ||
+      feedback_frame_interval_us_>kContinuousControlMaximumObservationAgeUs) {
+    const auto reason=frame.now_us-frame.observed_at_us>=kContinuousControlMaximumObservationAgeUs?
+        VelocityHistoryState::stale_observation:VelocityHistoryState::unsupported_interval;
+    target_velocity_.reset(reason);disturbance_velocity_.reset(reason);
+    velocity_x_=velocity_y_=0.F;
+  }
   background_valid_this_frame_ = frame.background.valid &&
       last_geometry_observed_at_us_ != 0U &&
       frame.background.previous_observed_at_us == last_geometry_observed_at_us_ &&
@@ -2578,6 +2602,7 @@ void MobileControlCore::reset() noexcept {
   last_geometry_observed_at_us_ = 0U;
   quiet_background_since_us_ = 0U;
   feedback_frame_interval_us_ = 0U;
+  feedback_previous_observed_at_us_=0U;
   background_valid_this_frame_ = false;
   association_shift_this_frame_ = false;
   known_owner_resolved_this_frame_ = false;

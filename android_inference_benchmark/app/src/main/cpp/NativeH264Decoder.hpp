@@ -1,5 +1,6 @@
 #pragma once
 #include "InferenceDeadlineAdmission.hpp"
+#include "DecoderCallbackOwnership.hpp"
 
 #ifndef VF_NATIVE_DECODER_REPORT_ONLY
 #include <jni.h>
@@ -319,12 +320,15 @@ public:
       std::int64_t presentation_time_us);
   void update_java_decoder_format(
       std::string codec_name, std::int32_t color_format, std::int32_t color_standard,
-      std::int32_t color_range, std::int32_t width, std::int32_t height);
+      std::int32_t color_range, std::int32_t width, std::int32_t height,
+      std::optional<DecoderCallbackToken> token=std::nullopt);
+  [[nodiscard]] std::array<std::uint64_t,2> java_callback_context() const;
+  [[nodiscard]] bool publish_java_codec(DecoderCallbackToken token);
   [[nodiscard]] bool has_fatal_decoder_failure() const;
   void discard_java_decoded_output(
-      std::int64_t presentation_time_us, std::string reason, bool fatal);
+      std::int64_t presentation_time_us, std::string reason, bool fatal,std::optional<DecoderCallbackToken> token=std::nullopt);
   void discard_java_compressed_access_unit(
-      std::int64_t presentation_time_us, std::string reason, bool fatal);
+      std::int64_t presentation_time_us, std::string reason, bool fatal,std::optional<DecoderCallbackToken> token=std::nullopt);
   /** Recreates only MediaCodec; QNN and the bound UDP socket stay live. */
   [[nodiscard]] bool restart_after_stream_discontinuity();
   void complete_stream_restart(
@@ -461,6 +465,7 @@ private:
   bool output_window_owned_{};
   JavaVM* java_vm_{};
   std::uint64_t java_decoder_binding_generation_{};
+  DecoderCallbackOwnership java_callback_ownership_{};
   jobject java_decoder_object_{};
   jmethodID java_offer_access_unit_method_{};
   jmethodID java_has_fatal_failure_method_{};

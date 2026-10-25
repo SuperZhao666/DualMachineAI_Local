@@ -15,6 +15,7 @@
 #include <cmath>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <sstream>
 
 namespace vfdual_android {
@@ -65,7 +66,7 @@ void record_dispatch(std::uint64_t sequence, std::uint64_t ticket, std::uint64_t
       {id, sequence, ticket, at, returned, budget, output.delta_x, output.delta_y, outcome,
        g_control_core.control_trace().count};
 }
-std::array<double,7> g_saved_calibration{};
+std::optional<MobileResponseEstimator::RuntimeCalibration> g_saved_calibration;
 std::string g_calibration_scope;
 bool g_preserve_current_calibration{};
 std::atomic_uint64_t g_processed_frames{};
@@ -656,14 +657,17 @@ bool configure_makcu_control_profile(const MakcuControlProfile& profile) {
     std::scoped_lock lock(g_control_mutex);
     const auto& previous=g_control_core.response_estimator();
     const bool matching_scope = g_calibration_scope.starts_with(profile.model_token + "|");
-    if (matching_scope && g_preserve_current_calibration && previous.x().trusted && previous.y().trusted) {
-      g_saved_calibration={previous.x().response,previous.y().response,double(previous.delay_us()),
-          previous.x().quality,previous.y().quality,1.0,double(previous.updates())};
+    if(matching_scope && g_preserve_current_calibration) {
+      if(previous.x().trusted && previous.y().trusted)
+        g_saved_calibration=previous.runtime_calibration();
+      else g_saved_calibration.reset();
+    } else if(!matching_scope) {
+      g_saved_calibration.reset();
     }
     control_configured = g_control_core.configure(control_config);
-    if (control_configured && matching_scope && g_saved_calibration[5] != 0.0) {
-      (void)g_control_core.restore_response_calibration(float(g_saved_calibration[0]),float(g_saved_calibration[1]),
-          std::uint64_t(g_saved_calibration[2]),float(g_saved_calibration[3]),float(g_saved_calibration[4]));
+    if(control_configured && matching_scope && g_saved_calibration &&
+        !g_control_core.restore_runtime_response_calibration(*g_saved_calibration)) {
+      g_saved_calibration.reset();
     }
     g_preserve_current_calibration = control_configured && matching_scope;
   }
@@ -1091,6 +1095,10 @@ std::string makcu_move_bridge_report() {
   std::uint64_t response_delay_us{}, response_estimate_updates{};
   MobileResponseEstimator::DelayRange response_delay_range{};
   MobileResponseEstimator::LearningState response_learning_state{};
+  VelocityHistoryState target_velocity_state{},disturbance_velocity_state{};
+  unsigned target_velocity_points{},disturbance_velocity_points{};
+  std::uint64_t target_velocity_span{},disturbance_velocity_span{};
+  std::uint32_t pending_x_risk{},pending_y_risk{};
   bool observation_servo{};
   MobileTargetTrackerMetrics tracker_metrics{};
   MobileMotionPlannerMetrics motion_metrics{};
@@ -1112,6 +1120,13 @@ std::string makcu_move_bridge_report() {
     response_estimate_updates = g_control_core.response_estimator().updates();
     response_delay_range = g_control_core.response_estimator().delay_range();
     response_learning_state = g_control_core.response_estimator().learning_state();
+    target_velocity_state=g_control_core.target_velocity_history_state();
+    disturbance_velocity_state=g_control_core.disturbance_velocity_history_state();
+    target_velocity_points=g_control_core.target_velocity_history_points();
+    disturbance_velocity_points=g_control_core.disturbance_velocity_history_points();
+    target_velocity_span=g_control_core.target_velocity_history_span_us();
+    disturbance_velocity_span=g_control_core.disturbance_velocity_history_span_us();
+    pending_x_risk=g_control_core.pending_x_risk_reports();pending_y_risk=g_control_core.pending_y_risk_reports();
     observation_servo = g_control_core.observation_servo_enabled();
     tracker_metrics = g_control_core.tracker_metrics();
     motion_metrics = g_control_core.motion_metrics();
@@ -1497,6 +1512,14 @@ std::string makcu_move_bridge_report() {
         << " response_delay_candidate_count=" << response_delay_range.candidates
         << " response_delay_identifiable=" << response_delay_range.identifiable
         << " response_learning_state=" << static_cast<unsigned>(response_learning_state)
+        << " target_velocity_history_state=" << velocity_history_state_name(target_velocity_state)
+        << " disturbance_velocity_history_state=" << velocity_history_state_name(disturbance_velocity_state)
+        << " target_velocity_history_points=" << target_velocity_points
+        << " disturbance_velocity_history_points=" << disturbance_velocity_points
+        << " target_velocity_history_span_us=" << target_velocity_span
+        << " disturbance_velocity_history_span_us=" << disturbance_velocity_span
+        << " pending_visibility_reports_x=" << pending_x_risk
+        << " pending_visibility_reports_y=" << pending_y_risk
         << " response_estimate_updates=" << response_estimate_updates
         << " background_motion_frames=" << control_metrics.background_motion_frames
         << " background_motion_unavailable_frames=" << control_metrics.background_motion_unavailable_frames
@@ -1608,7 +1631,7 @@ void set_control_calibration_scope(const std::string& scope) {
 bool restore_control_calibration(float x,float y,std::uint64_t delay,float qx,float qy) {
   std::scoped_lock lock(g_control_mutex);
   if (g_calibration_scope.empty() || !g_control_core.restore_response_calibration(x,y,delay,qx,qy)) return false;
-  g_saved_calibration={x,y,double(delay),qx,qy,1.0,0.0};
+  g_saved_calibration=g_control_core.response_estimator().runtime_calibration();
   g_preserve_current_calibration = true;
   return true;
 }

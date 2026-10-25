@@ -25,6 +25,8 @@
 
 #include "NativeH264Decoder.hpp"
 #include "DatagramReceiveResult.hpp"
+#include "ReadyProbeSession.hpp"
+#include "NeverWorkingRouteGuard.hpp"
 #include "ReceiverIdleBackoff.hpp"
 #include "ReceiverRepeatResyncPolicy.hpp"
 #include "ReceiverRecoveryPolicy.hpp"
@@ -40,12 +42,9 @@ constexpr std::uint16_t kMinimumPort = 1024;
 constexpr std::uint16_t kIdrRequestPort = 5001;
 constexpr std::uint16_t kCat6ReadyPort = 5003;
 constexpr std::uint16_t kCat6ProbePort = 5004;
-constexpr std::size_t kCat6ProbeBytes = 1200;
-constexpr std::size_t kMaximumCat6ProbeTokenLength = 64;
+constexpr std::size_t kCat6ProbeBytes = vfdual_android::kReadyProbeBytes;
 constexpr std::chrono::milliseconds kCat6ReadyInterval{250};
 constexpr std::string_view kCat6ReadyPrefix{"VF_CAT6_READY_V1|"};
-constexpr std::string_view kCat6ProbePrefix{"VF_CAT6_PROBE_V1|"};
-constexpr std::string_view kCat6ProbeAckPrefix{"VF_CAT6_PROBE_ACK_V1|"};
 constexpr std::size_t kMaximumInflightAccessUnits = 4;
 constexpr std::uint64_t kAccessUnitReassemblyTtlUs = 50'000;
 constexpr std::uint64_t kInitialReceiveTimeoutUs = 100'000;
@@ -298,7 +297,9 @@ public:
     running_ = true;
     startup_stage_ = ReceiverStartupStage::running;
     try {
-      worker_ = std::thread(&NativeVideoReceiver::run, this, socket);
+      route_generation_ = initial_route_.begin({static_cast<std::uint64_t>(network_handle),
+          ntohl(local_address.s_addr),ntohl(expected_source_address.s_addr)});
+      worker_ = std::thread(&NativeVideoReceiver::run, this, socket, route_generation_);
     } catch (const std::system_error& failure) {
       startup_stage_ = ReceiverStartupStage::worker_thread_failed;
       startup_errno_ = failure.code().value() == 0 ? EAGAIN : failure.code().value();
@@ -330,6 +331,7 @@ public:
   void stop() {
     std::scoped_lock lock(mutex_);
     running_ = false;
+    initial_route_.end(route_generation_);
     if (socket_ >= 0) {
       ::shutdown(socket_, SHUT_RDWR);
       ::close(socket_);
@@ -338,6 +340,16 @@ public:
     if (worker_.joinable()) worker_.join();
     network_bound_ = false;
     startup_stage_ = ReceiverStartupStage::stopped;
+  }
+
+  bool claim_unstarted_route(std::string_view local, std::string_view host, net_handle_t network) {
+    in_addr local_address{},host_address{};
+    const std::string local_text(local),host_text(host);
+    if(::inet_pton(AF_INET,local_text.c_str(),&local_address)!=1 ||
+        ::inet_pton(AF_INET,host_text.c_str(),&host_address)!=1) return false;
+    std::scoped_lock lock(mutex_);
+    return running_ && initial_route_.claim({static_cast<std::uint64_t>(network),
+        ntohl(local_address.s_addr),ntohl(host_address.s_addr)});
   }
 
   std::string report() const {
@@ -543,7 +555,7 @@ private:
         vfdual_android::NativeH264Decoder::kStreamRestartTimeoutUs;
   }
 
-  void run(int socket) {
+  void run(int socket, std::uint64_t route_generation) {
     vfdual::AccessUnitReassembler reassembler(kMaximumInflightAccessUnits);
     // One extra byte distinguishes an oversized valid prefix after recvfrom
     // truncation from an exact legal maximum-sized packet.
@@ -666,6 +678,10 @@ private:
         ++metrics_.foreign_source_datagrams;
         continue;
       }
+      if (!initial_route_.admit(route_generation)) {
+        ++metrics_.rejected_datagrams;
+        continue;
+      }
       const bool source_sequence_restarted = source_decision ==
           vfdual_android::ReceiverSourceDecision::restart_source_sequence;
       const bool source_restarted = source_sequence_restarted || source_decision ==
@@ -782,9 +798,12 @@ private:
         (void)request_idr(socket, now_us, true, false);
       }
     }
+    initial_route_.end(route_generation);
     running_ = false;
   }
 
+  vfdual_android::NeverWorkingRouteGuard initial_route_;
+  std::uint64_t route_generation_{};
   mutable std::mutex mutex_;
   std::thread worker_;
   std::atomic_bool running_{false};
@@ -811,34 +830,6 @@ private:
   std::string local_ipv4_;
   std::string expected_source_ipv4_;
 };
-
-[[nodiscard]] bool valid_cat6_probe_token(std::string_view token) noexcept {
-  if (token.empty() || token.size() > kMaximumCat6ProbeTokenLength) return false;
-  return std::all_of(token.begin(), token.end(), [](char value) {
-    return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z') ||
-        (value >= 'a' && value <= 'z') || value == '_' || value == '-';
-  });
-}
-
-[[nodiscard]] bool make_cat6_probe_ack(const char* datagram, std::size_t length,
-                                       std::array<char, kCat6ProbeBytes>& response) {
-  if (datagram == nullptr || length != kCat6ProbeBytes) return false;
-  const char* const end = datagram + length;
-  const char* const header_end = std::find(datagram, end, '\0');
-  if (header_end == end || std::any_of(header_end, end, [](char value) { return value != 0; })) {
-    return false;
-  }
-  const std::string_view header(datagram, static_cast<std::size_t>(header_end - datagram));
-  if (!header.starts_with(kCat6ProbePrefix) || !header.ends_with('|')) return false;
-  const std::string_view token = header.substr(
-      kCat6ProbePrefix.size(), header.size() - kCat6ProbePrefix.size() - 1U);
-  if (!valid_cat6_probe_token(token)) return false;
-  const std::string ack = std::string(kCat6ProbeAckPrefix) + std::string(token) + "|";
-  if (ack.size() > response.size()) return false;
-  response.fill(0);
-  std::copy(ack.begin(), ack.end(), response.begin());
-  return true;
-}
 
 [[nodiscard]] std::string requester_ipv4_text(std::uint32_t network_order_ipv4) {
   if (network_order_ipv4 == 0U) return "none";
@@ -903,9 +894,10 @@ public:
     multicast_ttl_configured_ = false;
     broadcast_socket_errno_ = 0;
     probes_received_ = 0;
+    invalid_probes_ = 0;
+    empty_probe_datagrams_ = 0;
     probe_acks_sent_ = 0;
     probe_ack_failures_ = 0;
-    last_requester_ipv4_network_order_.store(0U);
     if (network_handle == NETWORK_UNSPECIFIED) {
       stage_ = Cat6ReadyStage::invalid_arguments;
       startup_errno_ = EINVAL;
@@ -1012,7 +1004,8 @@ public:
     running_ = true;
     stage_ = Cat6ReadyStage::running;
     try {
-      worker_ = std::thread(&Cat6ReadyAgent::run, this, socket);
+      requester_generation_ = requester_session_.begin(ntohl(local_address.s_addr));
+      worker_ = std::thread(&Cat6ReadyAgent::run, this, socket, requester_generation_);
     } catch (const std::system_error& failure) {
       stage_ = Cat6ReadyStage::worker_thread_failed;
       startup_errno_ = failure.code().value() == 0 ? EAGAIN : failure.code().value();
@@ -1044,6 +1037,7 @@ public:
   void stop() {
     std::scoped_lock lock(mutex_);
     running_ = false;
+    requester_session_.end(requester_generation_);
     if (socket_ >= 0) {
       ::shutdown(socket_, SHUT_RDWR);
       ::close(socket_);
@@ -1080,21 +1074,23 @@ public:
            << " multicast_interface_configured=" << multicast_interface_configured_
            << " multicast_ttl_configured=" << multicast_ttl_configured_
            << " probes_received=" << probes_received_
+           << " invalid_probes=" << invalid_probes_
+           << " empty_probe_datagrams=" << empty_probe_datagrams_
            << " probe_acks_sent=" << probe_acks_sent_
            << " probe_ack_failures=" << probe_ack_failures_
            << " last_requester_ipv4=" << requester_ipv4_text(
-               last_requester_ipv4_network_order_.load());
+               htonl(requester_session_.requester(monotonic_microseconds())));
     return result.str();
   }
 
   [[nodiscard]] std::string requester_ipv4() const {
-    return requester_ipv4_text(last_requester_ipv4_network_order_.load());
+    return requester_ipv4_text(htonl(requester_session_.requester(monotonic_microseconds())));
   }
 
   ~Cat6ReadyAgent() { stop(); }
 
 private:
-  void run(int socket) {
+  void run(int socket, std::uint64_t requester_generation) {
     std::array<char, kCat6ProbeBytes + 1U> probe{};
     std::array<char, kCat6ProbeBytes> response{};
     std::uint64_t sequence = 0U;
@@ -1120,16 +1116,21 @@ private:
       socklen_t requester_size = sizeof(requester);
       const ssize_t received = ::recvfrom(socket, probe.data(), probe.size(), 0,
           reinterpret_cast<sockaddr*>(&requester), &requester_size);
-      if (received <= 0) {
-        if (!running_) break;
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-        last_socket_errno_ = errno;
+      const int receive_errno = received < 0 ? errno : 0;
+      if (!running_) break;
+      const auto bytes = received > 0 ? static_cast<std::size_t>(received) : 0U;
+      const auto decision = requester_session_.receive(requester_generation,
+          received, receive_errno, {probe.data(), bytes}, ntohl(requester.sin_addr.s_addr),
+          monotonic_microseconds(), response);
+      if (decision.outcome == vfdual_android::ReadyProbeSession::Outcome::fatal) {
+        last_socket_errno_ = decision.error;
         stage_ = Cat6ReadyStage::worker_socket_failed;
         break;
       }
-      ++probes_received_;
-      last_requester_ipv4_network_order_.store(requester.sin_addr.s_addr);
-      if (!make_cat6_probe_ack(probe.data(), static_cast<std::size_t>(received), response)) {
+      if (received > 0) ++probes_received_;
+      if (received == 0) ++empty_probe_datagrams_;
+      if (decision.outcome != vfdual_android::ReadyProbeSession::Outcome::valid_probe) {
+        if (received >= 0) ++invalid_probes_;
         continue;
       }
       const ssize_t sent = ::sendto(
@@ -1142,6 +1143,7 @@ private:
         last_socket_errno_ = errno;
       }
     }
+    requester_session_.end(requester_generation);
     running_ = false;
   }
 
@@ -1182,13 +1184,16 @@ private:
   std::atomic_bool multicast_ttl_configured_{false};
   std::atomic_int broadcast_socket_errno_{};
   std::atomic_uint64_t probes_received_{};
+  std::atomic_uint64_t invalid_probes_{};
+  std::atomic_uint64_t empty_probe_datagrams_{};
   std::atomic_uint64_t probe_acks_sent_{};
   std::atomic_uint64_t probe_ack_failures_{};
   int socket_{-1};
   sockaddr_in host_{};
   sockaddr_in broadcast_{};
   std::string local_ipv4_;
-  std::atomic<std::uint32_t> last_requester_ipv4_network_order_{};
+  vfdual_android::ReadyProbeSession requester_session_;
+  std::uint64_t requester_generation_{};
 };
 
 NativeVideoReceiver& receiver() { static NativeVideoReceiver instance; return instance; }
@@ -1265,6 +1270,22 @@ Java_com_visionforge_inferencebenchmark_QnnHtpBridge_startNativeCat6ReadyAgent(
   environment->ReleaseStringUTFChars(host_ipv4, host_ipv4_chars);
   environment->ReleaseStringUTFChars(local_ipv4, local_ipv4_chars);
   return started ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_visionforge_inferencebenchmark_QnnHtpBridge_claimNativeUnstartedWirelessVideoReceiver(
+    JNIEnv* environment, jclass, jstring local, jstring host, jlong network) {
+  if(local==nullptr || host==nullptr || network<=0) return JNI_FALSE;
+  const char* local_text=environment->GetStringUTFChars(local,nullptr);
+  if(local_text==nullptr) return JNI_FALSE;
+  const char* host_text=environment->GetStringUTFChars(host,nullptr);
+  if(host_text==nullptr) {
+    environment->ReleaseStringUTFChars(local,local_text);return JNI_FALSE;
+  }
+  const bool claimed=receiver().claim_unstarted_route(local_text,host_text,static_cast<net_handle_t>(network));
+  environment->ReleaseStringUTFChars(host,host_text);
+  environment->ReleaseStringUTFChars(local,local_text);
+  return claimed?JNI_TRUE:JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL

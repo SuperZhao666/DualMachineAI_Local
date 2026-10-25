@@ -219,44 +219,21 @@ final class Cat6MouseButtonInput implements ControlButtonInput, AutoCloseable {
             DatagramSocket socket,
             String expectedHost,
             long workerGeneration) throws IOException {
-        byte[] bytes = new byte[Cat6MouseButtonProtocol.PACKET_BYTES];
-        DatagramPacket datagram = new DatagramPacket(bytes, bytes.length);
-        int activeSessionId = 0;
-        int lastSequence = 0;
-        boolean sequenceKnown = false;
+        Cat6MouseButtonDatagramReceiver receiver=new Cat6MouseButtonDatagramReceiver(expectedHost,Cat6MouseButtonProtocol.PORT);
         while (generation.get() == workerGeneration && !socket.isClosed()) {
-            datagram.setLength(bytes.length);
+            Cat6MouseButtonDatagramReceiver.Accepted accepted;
             try {
-                socket.receive(datagram);
+                accepted=receiver.receive(socket);
             } catch (SocketTimeoutException timeout) {
                 expireLeaseIfNeeded(SystemClock.elapsedRealtimeNanos());
                 continue;
             }
-            String sourceHost = datagram.getAddress() == null
-                    ? "" : datagram.getAddress().getHostAddress();
-            if (!expectedHost.equals(sourceHost)
-                    || datagram.getPort() != Cat6MouseButtonProtocol.PORT) {
+            if (accepted==null) {
                 rejectedPackets++;
                 continue;
             }
-            Cat6MouseButtonProtocol.Packet packet =
-                    Cat6MouseButtonProtocol.decode(bytes, datagram.getLength());
-            if (packet == null) {
-                rejectedPackets++;
-                continue;
-            }
-            boolean newSession = packet.sessionId != activeSessionId;
-            if (!newSession && sequenceKnown
-                    && !Cat6MouseButtonProtocol.isNewerSequence(
-                    packet.sequence, lastSequence)) {
-                rejectedPackets++;
-                continue;
-            }
-            activeSessionId = packet.sessionId;
-            lastSequence = packet.sequence;
-            sequenceKnown = true;
             acceptPacket(
-                    packet.buttonMask, newSession, workerGeneration);
+                    accepted.packet.buttonMask, accepted.newSession, workerGeneration);
         }
     }
 

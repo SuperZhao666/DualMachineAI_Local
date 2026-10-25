@@ -14,12 +14,16 @@ final class MobileRuntimeReportStore {
         }
     }
     static final class Sample {
-        final long generation, lifecycleGeneration, sampledAtMillis;
+        final long generation, lifecycleGeneration, sampledAtMillis,authorizationRevision;
         final MobileRuntimeSnapshot snapshot;
         Sample(long generation, long lifecycleGeneration, long sampledAtMillis, MobileRuntimeSnapshot snapshot) {
+            this(generation,lifecycleGeneration,sampledAtMillis,-1,snapshot);
+        }
+        Sample(long generation,long lifecycleGeneration,long sampledAtMillis,long authorizationRevision,MobileRuntimeSnapshot snapshot) {
             this.generation = generation;
             this.lifecycleGeneration = lifecycleGeneration;
             this.sampledAtMillis = sampledAtMillis;
+            this.authorizationRevision=authorizationRevision;
             this.snapshot = snapshot;
         }
     }
@@ -40,8 +44,12 @@ final class MobileRuntimeReportStore {
     }
     static synchronized boolean publish(long expectedGeneration, long lifecycleGeneration,
                                         long sampledAtMillis, MobileRuntimeSnapshot snapshot) {
+        return publish(expectedGeneration,lifecycleGeneration,sampledAtMillis,-1,snapshot);
+    }
+    static synchronized boolean publish(long expectedGeneration,long lifecycleGeneration,
+            long sampledAtMillis,long authorizationRevision,MobileRuntimeSnapshot snapshot) {
         if (expectedGeneration != generation) return false;
-        latest = new Sample(generation, lifecycleGeneration, sampledAtMillis, snapshot);
+        latest = new Sample(generation, lifecycleGeneration, sampledAtMillis,authorizationRevision, snapshot);
         return true;
     }
 }

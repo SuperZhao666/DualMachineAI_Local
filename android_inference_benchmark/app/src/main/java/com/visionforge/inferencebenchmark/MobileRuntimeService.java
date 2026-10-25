@@ -38,6 +38,10 @@ public final class MobileRuntimeService extends Service {
     private final MobileActivityOwnership activityOwnership = new MobileActivityOwnership();
     private long reportGeneration;
     private final MobileRuntimeReportStore.Cursor reportCursor = new MobileRuntimeReportStore.Cursor();
+    private boolean resampleControlReport;
+    private long pipelineStartedAtMillis;
+    private boolean pipelineReceivedVideo;
+    private MobileTransportEndpoint knownWorkingRoute;
     private final java.util.concurrent.ExecutorService reportWorker = Executors.newSingleThreadExecutor();
     private final java.util.concurrent.atomic.AtomicBoolean reportPending = new java.util.concurrent.atomic.AtomicBoolean();
     private final ScheduledExecutorService transportStatusWorker = Executors.newSingleThreadScheduledExecutor();
@@ -279,10 +283,21 @@ public final class MobileRuntimeService extends Service {
         if (sampled.generation != sampledPipeline || sampled.lifecycleGeneration != sampledLifecycle
                 || sampled.sampledAtMillis == 0 || SystemClock.elapsedRealtime() - sampled.sampledAtMillis
                 > MobileRuntimeSnapshot.LIVE_VIDEO_MAX_AGE_MILLIS) {
-            controlRuntime.failClosed("runtime_report_not_current");
+            controlRuntime.failClosedForMissingHealth("runtime_report_not_current");
             return;
         }
         MobileRuntimeSnapshot snapshot = sampled.snapshot;
+        if(snapshot.reassembledAccessUnits>0) {pipelineReceivedVideo=true;knownWorkingRoute=activeEndpoint;}
+        if(activeEndpoint!=null && activeEndpoint.hasSameDataPlaneRoute(transportCatalog.selected()) &&
+                WirelessHostRediscoveryPolicy.shouldReset(activeEndpoint,pipelineStartedAtMillis,SystemClock.elapsedRealtime(),
+                        pipelineReceivedVideo?1:snapshot.reassembledAccessUnits,QnnHtpBridge.getNativeCat6ReadyAgentRequesterIpv4()) &&
+                QnnHtpBridge.claimNativeUnstartedWirelessVideoReceiver(activeEndpoint.localIpv4,
+                        activeEndpoint.hostIpv4,activeEndpoint.networkHandle)) {
+            MobileTransportEndpoint abandoned=activeEndpoint;
+            stopPipeline("wireless_never_worked_peer_rediscovery");
+            transportCatalog.resetWirelessHostDiscoveryIfSelectedRoute(abandoned);
+            return;
+        }
         if (retry.recoverFatal(snapshot, () -> stopPipeline("native_full_recovery_required"),
                 SystemClock::elapsedRealtime)) {
             publish(MobileRuntimePhase.FAILED, "接收或解码已终止，等待重试", retry.failureCode());
@@ -299,9 +314,14 @@ public final class MobileRuntimeService extends Service {
                 controlRuntime.failClosed("local_route_changed_during_health");
                 return;
             }
-            reportCursor.consume(sampled, () -> controlRuntime.reconcile(healthy,snapshot.nativeControlOutputRequestedKnown,
+            reportCursor.consume(sampled, () -> {if(!controlRuntime.reconcileAtRevision(sampled.authorizationRevision,
+                    healthy,snapshot.nativeControlOutputRequestedKnown,
                     snapshot.nativeControlOutputRequested,snapshot.nativeControlOutputEffective,
-                    snapshot.nativeControlOutputRecoverySuspended));
+                    snapshot.nativeControlOutputRecoverySuspended)) {
+                resampleControlReport=true;
+                events.write("runtime_control_report_superseded","sample_revision="+sampled.authorizationRevision
+                        +" current_revision="+controlRuntime.authorizationRevision()+" fresh_report_requested=true");
+            }});
         }});
         recordDiagnostics(snapshot);
     }
@@ -313,18 +333,25 @@ public final class MobileRuntimeService extends Service {
                 boolean consumeQueued = false;
                 try {
                     final long sampledAt = SystemClock.elapsedRealtime();
+                    final long controlRevision=controlRuntime.authorizationRevision();
                     MobileRuntimeSnapshot snapshot = MobileRuntimeSnapshot.from(
                             QnnHtpBridge.getNativeVideoReceiverReport(), QnnHtpBridge.getNativeH264DecoderReport(),
                             QnnHtpBridge.getNativeQnnRealtimeReport(), controlRuntime.makcuReport());
                     boolean current = authorization.ifCurrent(lifecycle, () -> MobileRuntimeReportStore.publish(
-                            pipelineGeneration, lifecycle, sampledAt, snapshot));
+                            pipelineGeneration, lifecycle, sampledAt,controlRevision, snapshot));
                     // Consume the completed sample promptly, without another
                     // sampling request or a backlog on the lifecycle worker.
                     if (current) {
                         consumeQueued = true;
                         submit(() -> {
                             try { consumeCurrentSample(); }
-                            finally { reportPending.set(false); }
+                            finally {
+                                reportPending.set(false);
+                                if(resampleControlReport && running && !destroying) {
+                                    resampleControlReport=false;
+                                    requestReportSample(authorization.generation(),reportGeneration);
+                                }
+                            }
                         });
                     }
                 } catch (RuntimeException | LinkageError failure) {
@@ -421,6 +448,8 @@ public final class MobileRuntimeService extends Service {
             stopPipeline("start_cancelled"); return;
         }
         activeEndpoint=endpoint; running=true;
+        pipelineStartedAtMillis=SystemClock.elapsedRealtime();
+        pipelineReceivedVideo=knownWorkingRoute!=null && knownWorkingRoute.hasSameDataPlaneRoute(endpoint);
         retry.reset();
         reportGeneration = MobileRuntimeReportStore.begin();
         acquireLocks();
@@ -461,6 +490,7 @@ public final class MobileRuntimeService extends Service {
                 + " foreground=" + foreground + " endpoint={"
                 + (activeEndpoint == null ? "none" : activeEndpoint.detail()) + "}");
         running=false; activeEndpoint=null;
+        pipelineStartedAtMillis=0;pipelineReceivedVideo=false;resampleControlReport=false;
         reportGeneration = MobileRuntimeReportStore.begin();
         if(controlRuntime!=null) controlRuntime.failClosed(reason);
         try { if(pipeline!=null) pipeline.stop(); }
@@ -661,7 +691,8 @@ public final class MobileRuntimeService extends Service {
                         + " detail={" + assets.detail + "} stack={" + stack + "}",
                 assets.disposition,
                 "inference_asset_resolution_failed".equals(assets.failureCode)
-                        ? (backend.requiresQnnRuntime
+                        ? (assets.disposition==MobilePipelineCoordinator.FailureDisposition.RETRYABLE
+                        ? "inference_asset_io_retryable" : backend.requiresQnnRuntime
                         ? "qnn_asset_bundle_invalid"
                         : "portable_model_unavailable")
                         : assets.failureCode);

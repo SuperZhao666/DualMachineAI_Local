@@ -27,6 +27,39 @@ class MobileResponseEstimator final {
     // remains a scoped prior, not proof of current physical HID completion.
     bool identifiable{};
   };
+  // Same-scope in-memory migration is not a cold, validated file restore.
+  // Keep its known uncertainty and identification qualification as well as
+  // the small nominal-delay prior; old frame/command histories are not moved.
+  struct RuntimeCalibration {
+    Axis x{},y{};
+    std::uint64_t delay_us{};
+    DelayRange range{};
+    bool restored_reference{},delay_established{};
+    std::uint64_t restored_delay_us{},updates{},delay_updates{};
+    std::array<std::uint64_t,5> delay_history{};
+    std::size_t delay_count{};
+    LearningState learning_state{LearningState::warming_up};
+  };
+  [[nodiscard]] RuntimeCalibration runtime_calibration()const noexcept {
+    return {x_,y_,delay_us_,delay_range_,restored_reference_,delay_established_,
+        restored_delay_us_,updates_,delay_updates_,delay_history_,delay_count_,learning_state_};
+  }
+  [[nodiscard]] bool restore_runtime_calibration(const RuntimeCalibration& saved) noexcept {
+    if(!saved.x.trusted || !saved.y.trusted ||
+        (saved.range.identifiable && saved.range.candidates==0U) ||
+        saved.range.candidates>24U ||
+        saved.range.minimum_us<8'000U || saved.range.maximum_us>100'000U ||
+        saved.range.minimum_us>saved.delay_us || saved.range.maximum_us<saved.delay_us ||
+        (saved.restored_reference && (saved.restored_delay_us<8'000U || saved.restored_delay_us>100'000U)))return false;
+    for(std::size_t i=0;i<std::min(saved.delay_count,saved.delay_history.size());++i)
+      if(saved.delay_history[i]<8'000U || saved.delay_history[i]>100'000U)return false;
+    if(!restore(saved.x.response,saved.y.response,saved.delay_us,saved.x.quality,saved.y.quality))return false;
+    delay_range_=saved.range;restored_reference_=saved.restored_reference;
+    restored_delay_us_=saved.restored_delay_us;delay_established_=saved.delay_established;
+    delay_history_=saved.delay_history;delay_count_=saved.delay_count;
+    updates_=saved.updates;delay_updates_=saved.delay_updates;learning_state_=saved.learning_state;
+    return true;
+  }
   void accept(int x, int y, std::uint64_t at) noexcept {
     commands_[command_count_++ % commands_.size()] = {x, y, at};
   }
@@ -183,6 +216,10 @@ class MobileResponseEstimator final {
     // Semantic evidence: every plausible delay agrees on a near-zero trend.
     // An uncertain proposal clamped to zero must never acquire this meaning.
     bool x_stationary{}, y_stationary{};
+    // Semantic interval signs, independent of whether enough samples support
+    // a velocity fit. Diagnostics remain write-only; these are explicit input
+    // validity facts usable to retire an old contrary estimate.
+    bool x_positive_supported{},x_negative_supported{},y_positive_supported{},y_negative_supported{};
   };
   struct TargetObservation { float x{}, y{}; std::uint64_t at{}; };
   [[nodiscard]] VisibleMotion disturbance_velocity(std::span<const TargetObservation> points,
@@ -208,6 +245,7 @@ class MobileResponseEstimator final {
       float velocity{}; bool valid{}, proposal_limited{};
       DisturbanceAxisEvidence evidence{};
       bool stationary{};
+      bool positive_supported{},negative_supported{};
     };
     const auto axis=[&](bool y) -> AxisMotion {
       AxisMotion motion{.evidence=result.x_evidence};
@@ -254,6 +292,8 @@ class MobileResponseEstimator final {
       evidence.raw_quality=best_quality;
       evidence.quality_weight=std::clamp((best_quality-.30)/.50,0.0,1.0);
       evidence.has_interval=true;
+      motion.positive_supported=minimum>20;
+      motion.negative_supported=maximum<-20;
       // Every plausible response delay agrees on a near-zero relative trend.
       // This includes a player already following the person: background/world
       // motion is not a reason to inject an extra mouse movement. Two samples
@@ -292,6 +332,8 @@ class MobileResponseEstimator final {
     result.y_proposal_limited=y.proposal_limited;
     result.x_evidence=x.evidence; result.y_evidence=y.evidence;
     result.x_stationary=x.stationary; result.y_stationary=y.stationary;
+    result.x_positive_supported=x.positive_supported;result.x_negative_supported=x.negative_supported;
+    result.y_positive_supported=y.positive_supported;result.y_negative_supported=y.negative_supported;
     return result;
   }
   void clear_history() noexcept {
