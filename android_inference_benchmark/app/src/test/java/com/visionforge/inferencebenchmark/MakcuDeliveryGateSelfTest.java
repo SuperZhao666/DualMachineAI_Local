@@ -1,0 +1,281 @@
+package com.visionforge.inferencebenchmark;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/** Dependency-free recovery and explicit-authorization contract. */
+final class MakcuDeliveryGateSelfTest {
+    static void run() {
+        verifiesMatchingRecoveryRestoresPriorDelivery();
+        verifiesNewGenerationSupersedesStaleResume();
+        verifiesExplicitDisableCancelsRecoveryEligibility();
+        verifiesSuspensionWithoutPriorDeliveryCannotEnableOutput();
+        verifiesSuspendDrainsPendingAndWaitsForSerialIdle();
+        verifiesPhysicalReleaseRevokesWithoutMainCallback();
+        verifiesPendingMoveAndTicketRemainOneSnapshot();
+        verifiesHotPathCanReuseOnePendingMoveSnapshot();
+        verifiesTakenMoveStaysUnsentAcrossRecoveryResume();
+    }
+
+    private static void verifiesMatchingRecoveryRestoresPriorDelivery() {
+        MakcuDeliveryGate gate = new MakcuDeliveryGate();
+        require(!gate.isDeliveryAllowed());
+        require(gate.setUserAllowed(true));
+        require(gate.isDeliveryAllowed());
+
+        gate.suspendForRecovery(10L);
+        require(gate.isRecoverySuspended() && !gate.isDeliveryAllowed());
+        require(!gate.resumeAfterRecovery(9L));
+        require(gate.resumeAfterRecovery(10L));
+        require(gate.isDeliveryAllowed());
+    }
+
+    private static void verifiesNewGenerationSupersedesStaleResume() {
+        MakcuDeliveryGate gate = new MakcuDeliveryGate();
+        require(gate.setUserAllowed(true));
+        gate.suspendForRecovery(20L);
+        gate.suspendForRecovery(21L);
+        require(!gate.resumeAfterRecovery(20L));
+        require(gate.resumeAfterRecovery(21L));
+        require(gate.isDeliveryAllowed());
+    }
+
+    private static void verifiesExplicitDisableCancelsRecoveryEligibility() {
+        MakcuDeliveryGate gate = new MakcuDeliveryGate();
+        require(gate.setUserAllowed(true));
+        gate.suspendForRecovery(30L);
+        require(gate.setUserAllowed(false));
+        require(gate.isRecoverySuspended());
+        require(!gate.resumeAfterRecovery(30L));
+        require(!gate.isRecoverySuspended());
+        require(gate.setUserAllowed(true));
+        require(!gate.resumeAfterRecovery(30L));
+        require(gate.isDeliveryAllowed());
+
+        gate.suspendForRecovery(31L);
+        gate.failClosed();
+        require(!gate.isRecoverySuspended());
+        require(!gate.resumeAfterRecovery(31L));
+        require(!gate.isDeliveryAllowed());
+    }
+
+    private static void verifiesSuspensionWithoutPriorDeliveryCannotEnableOutput() {
+        MakcuDeliveryGate gate = new MakcuDeliveryGate();
+        gate.suspendForRecovery(40L);
+        require(!gate.setUserAllowed(true));
+        require(gate.isRecoverySuspended());
+        require(!gate.resumeAfterRecovery(40L));
+        require(!gate.isDeliveryAllowed());
+        require(!gate.isRecoverySuspended());
+        require(gate.setUserAllowed(true));
+        require(gate.isDeliveryAllowed());
+        require(gate.setUserAllowed(false));
+        require(!gate.isRecoverySuspended());
+    }
+
+    private static void verifiesSuspendDrainsPendingAndWaitsForSerialIdle() {
+        MakcuPendingMoveSlot pendingMove = new MakcuPendingMoveSlot();
+        pendingMove.offer(17L, 23L);
+        Object serialIoLock = new Object();
+        MakcuDeliveryGate gate = new MakcuDeliveryGate(pendingMove, serialIoLock);
+        require(gate.setUserAllowed(true));
+        CountDownLatch serialEntered = new CountDownLatch(1);
+        CountDownLatch releaseSerial = new CountDownLatch(1);
+        AtomicBoolean suspendReturned = new AtomicBoolean();
+
+        Thread writer = new Thread(() -> {
+            synchronized (serialIoLock) {
+                serialEntered.countDown();
+                await(releaseSerial);
+            }
+        });
+        writer.start();
+        await(serialEntered);
+
+        Thread suspender = new Thread(() -> {
+            gate.suspendForRecovery(50L);
+            suspendReturned.set(true);
+        });
+        suspender.start();
+        waitUntil(() -> gate.isRecoverySuspended() && !pendingMove.hasPending());
+        pendingMove.offer(19L, 29L);
+        require(!suspendReturned.get());
+        releaseSerial.countDown();
+        join(writer);
+        join(suspender);
+        require(suspendReturned.get());
+        require(!pendingMove.hasPending());
+        require(!gate.isDeliveryAllowed());
+    }
+
+    private static void verifiesPhysicalReleaseRevokesWithoutMainCallback() {
+        MakcuPendingMoveSlot pendingMove = new MakcuPendingMoveSlot();
+        pendingMove.offer(17L, 23L);
+        Object serialIoLock = new Object();
+        MakcuDeliveryGate gate = new MakcuDeliveryGate(pendingMove, serialIoLock);
+        gate.updatePhysicalButtonMask(ControlTrigger.SIDE_BUTTON_2.buttonMask);
+        gate.setRequiredPhysicalButtonMask(ControlTrigger.SIDE_BUTTON_2.buttonMask);
+        require(gate.setUserAllowed(true));
+        require(gate.isDeliveryAllowed());
+
+        // This is the serial-reader fast path. Deliberately never run a main
+        // thread callback: offer and final-write checks must already be shut.
+        long rejectedTicket = gate.updatePhysicalButtonMask(0);
+        boolean offerWouldBeAccepted = gate.isDeliveryAllowed()
+                && gate.isPhysicalTriggerSatisfied();
+        boolean finalWriteWouldBeAccepted;
+        synchronized (serialIoLock) {
+            finalWriteWouldBeAccepted = gate.isDeliveryAllowed()
+                    && gate.isPhysicalTriggerSatisfied();
+        }
+
+        require(rejectedTicket == 23L);
+        require(!pendingMove.hasPending());
+        require(!offerWouldBeAccepted);
+        require(!finalWriteWouldBeAccepted);
+    }
+
+    private static void verifiesPendingMoveAndTicketRemainOneSnapshot() {
+        MakcuPendingMoveSlot slot = new MakcuPendingMoveSlot();
+        MakcuPendingMoveSlot.PendingMove snapshot =
+                new MakcuPendingMoveSlot.PendingMove();
+        slot.offer(17L, 23L, 31L);
+        require(slot.takeInto(snapshot));
+        require(snapshot.packed == 17L && snapshot.ticket == 23L
+                && snapshot.deadlineNanos == 31L);
+
+        // A stale failure for an identical displacement must not erase the
+        // newer native ticket that replaced it.
+        slot.offer(17L, 29L, 37L);
+        require(!slot.clearIfMatches(17L, 23L));
+        require(slot.takeInto(snapshot));
+        require(snapshot.packed == 17L && snapshot.ticket == 29L
+                && snapshot.deadlineNanos == 37L);
+    }
+
+    private static void verifiesHotPathCanReuseOnePendingMoveSnapshot() {
+        MakcuPendingMoveSlot slot = new MakcuPendingMoveSlot();
+        MakcuPendingMoveSlot.PendingMove destination =
+                new MakcuPendingMoveSlot.PendingMove();
+        require(!slot.takeInto(destination));
+
+        slot.offer(31L, 37L, 41L);
+        require(slot.takeInto(destination));
+        require(destination.packed == 31L && destination.ticket == 37L
+                && destination.deadlineNanos == 41L);
+        require(!slot.hasPending());
+
+        slot.offer(41L, 43L, 47L);
+        require(slot.takeInto(destination));
+        require(destination.packed == 41L && destination.ticket == 43L
+                && destination.deadlineNanos == 47L);
+    }
+
+    private static void verifiesTakenMoveStaysUnsentAcrossRecoveryResume() {
+        final int trials = 500;
+        int oldPredicateWouldWrite = 0;
+        int silent = 0;
+        int wrote = 0;
+        int reportedFailure = 0;
+        for (int trial = 0; trial < trials; trial++) {
+            MakcuPendingMoveSlot slot = new MakcuPendingMoveSlot();
+            MakcuDeliveryGate gate = new MakcuDeliveryGate(slot, new Object());
+            require(gate.setUserAllowed(true));
+            slot.offer(0x0001_0001L, 1000L + trial, Long.MAX_VALUE, 1L);
+            MakcuPendingMoveSlot.PendingMove taken = new MakcuPendingMoveSlot.PendingMove();
+            require(gate.takePendingForCommit(taken));
+            CountDownLatch takenGate = new CountDownLatch(1);
+            CountDownLatch releaseWriter = new CountDownLatch(1);
+            MakcuDeliveryGate.TakenMoveCommit[] decision = new MakcuDeliveryGate.TakenMoveCommit[1];
+            Thread writer = new Thread(() -> {
+                takenGate.countDown();
+                await(releaseWriter);
+                decision[0] = gate.evaluateTakenMove(taken.authorizationEpoch);
+            });
+            writer.start();
+            await(takenGate);
+            gate.suspendForRecovery(70L);
+            require(gate.resumeAfterRecovery(70L));
+            if (gate.isDeliveryAllowed() && gate.isPhysicalTriggerSatisfied()) oldPredicateWouldWrite++;
+            releaseWriter.countDown();
+            join(writer);
+            if (decision[0] == MakcuDeliveryGate.TakenMoveCommit.WRITE) wrote++;
+            else if (decision[0] == MakcuDeliveryGate.TakenMoveCommit.DROP_SILENT) silent++;
+            else reportedFailure++;
+        }
+        System.out.println("usb_taken_move trials=" + trials
+                + " old_delivery_check_would_write=" + oldPredicateWouldWrite
+                + " new_write=" + wrote
+                + " new_silent=" + silent
+                + " new_failure=" + reportedFailure);
+        require(oldPredicateWouldWrite == trials && wrote == 0 && silent == trials);
+
+        MakcuPendingMoveSlot slot = new MakcuPendingMoveSlot();
+        MakcuDeliveryGate gate = new MakcuDeliveryGate(slot, new Object());
+        require(gate.setUserAllowed(true));
+        slot.offer(3L, 9L, Long.MAX_VALUE, 1L);
+        MakcuPendingMoveSlot.PendingMove fresh = new MakcuPendingMoveSlot.PendingMove();
+        require(gate.takePendingForCommit(fresh));
+        require(gate.evaluateTakenMove(fresh.authorizationEpoch)
+                == MakcuDeliveryGate.TakenMoveCommit.WRITE);
+
+        slot.offer(4L, 10L, Long.MAX_VALUE, 1L);
+        MakcuPendingMoveSlot.PendingMove recovered = new MakcuPendingMoveSlot.PendingMove();
+        require(gate.takePendingForCommit(recovered));
+        gate.suspendForRecovery(80L);
+        require(gate.resumeAfterRecovery(80L));
+        gate.suspendForRecovery(81L);
+        require(gate.resumeAfterRecovery(81L));
+        require(gate.isDeliveryAllowed());
+        require(gate.evaluateTakenMove(recovered.authorizationEpoch)
+                == MakcuDeliveryGate.TakenMoveCommit.DROP_SILENT);
+        slot.offer(5L, 11L, Long.MAX_VALUE, 1L);
+        MakcuPendingMoveSlot.PendingMove after = new MakcuPendingMoveSlot.PendingMove();
+        require(gate.takePendingForCommit(after));
+        require(gate.evaluateTakenMove(after.authorizationEpoch)
+                == MakcuDeliveryGate.TakenMoveCommit.WRITE);
+
+        slot.offer(6L, 12L, Long.MAX_VALUE, 1L);
+        MakcuPendingMoveSlot.PendingMove disabled = new MakcuPendingMoveSlot.PendingMove();
+        require(gate.takePendingForCommit(disabled));
+        gate.suspendForRecovery(82L);
+        require(gate.setUserAllowed(false));
+        require(gate.isRecoverySuspended());
+        require(gate.evaluateTakenMove(disabled.authorizationEpoch)
+                == MakcuDeliveryGate.TakenMoveCommit.DROP_AND_REPORT_FAILURE);
+    }
+
+    private static void waitUntil(Condition condition) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2L);
+        while (!condition.evaluate() && System.nanoTime() < deadline) Thread.yield();
+        require(condition.evaluate());
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            require(latch.await(2L, TimeUnit.SECONDS));
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while testing MAKCU delivery gate", exception);
+        }
+    }
+
+    private static void join(Thread thread) {
+        try {
+            thread.join(TimeUnit.SECONDS.toMillis(2L));
+            require(!thread.isAlive());
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while testing MAKCU delivery gate", exception);
+        }
+    }
+
+    private interface Condition {
+        boolean evaluate();
+    }
+
+    private static void require(boolean condition) {
+        if (!condition) throw new AssertionError("MAKCU delivery gate contract failed");
+    }
+}

@@ -1,0 +1,115 @@
+plugins { id 'com.android.application' }
+configurations { onnxRuntimeNative }
+dependencies {
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.27.0'
+    onnxRuntimeNative 'com.microsoft.onnxruntime:onnxruntime-android:1.27.0@aar'
+}
+def ortAar = configurations.onnxRuntimeNative.singleFile
+def qnnHeaders = rootProject.file('../vendor/qnn')
+def productionModel = new groovy.json.JsonSlurper().parse(
+        rootProject.file('../models/overwatch/production.json'))
+def selectedQnnLibrary = productionModel.selected_model?.qnn_library
+if (!(selectedQnnLibrary instanceof String)
+        || !(selectedQnnLibrary ==~ /lib[A-Za-z0-9_]+\.so/)) {
+    throw new GradleException('Production QNN library must be a plain .so filename')
+}
+def selectedQnnFile = file('src/main/jniLibs/arm64-v8a/' + selectedQnnLibrary)
+if (!selectedQnnFile.isFile()) throw new GradleException('Production QNN library is absent')
+def selectedQnnDigest = java.security.MessageDigest.getInstance('SHA-256').digest(
+        selectedQnnFile.bytes).encodeHex().toString()
+if (selectedQnnDigest != productionModel.selected_model.qnn_sha256) {
+    throw new GradleException('Production QNN library hash mismatch')
+}
+// A transport-only repair must not silently ship an unvalidated native controller.
+// The helper script verifies every native library and model against the installed APK.
+def nativeBaselinePath = providers.gradleProperty('nativeBaselineApk').orNull
+def nativeBaselineDir = layout.buildDirectory.dir('generated/nativeBaseline')
+if (nativeBaselinePath != null) {
+    def baselineFile = file(nativeBaselinePath)
+    def expectedHash = providers.gradleProperty('nativeBaselineSha256').get()
+    def stageNativeBaseline = tasks.register('stageNativeBaseline') {
+        inputs.file(baselineFile)
+        inputs.property('expectedHash', expectedHash)
+        outputs.file(nativeBaselineDir.map { it.file('arm64-v8a/libvisionforge_qnn_htp.so') })
+        doLast {
+            def digest = java.security.MessageDigest.getInstance('SHA-256')
+            baselineFile.withInputStream { stream ->
+                byte[] buffer = new byte[65536]
+                int count
+                while ((count = stream.read(buffer)) != -1) digest.update(buffer, 0, count)
+            }
+            if (digest.digest().encodeHex().toString() != expectedHash) {
+                throw new GradleException('Native baseline APK hash mismatch')
+            }
+            def destination = nativeBaselineDir.get().file('arm64-v8a/libvisionforge_qnn_htp.so').asFile
+            destination.parentFile.mkdirs()
+            def archive = new java.util.zip.ZipFile(baselineFile)
+            try {
+                // Native lifecycle/model selection is compiled into this APK.
+                // A transport-only baseline must carry the exact active graph,
+                // including its quantization, rather than silently loading an
+                // older native model contract beside a newer library.
+                def modelEntry = archive.getEntry('lib/arm64-v8a/' + selectedQnnLibrary)
+                if (modelEntry == null) throw new GradleException('Native baseline active QNN model is absent')
+                def baselineModelDigest = java.security.MessageDigest.getInstance('SHA-256')
+                archive.getInputStream(modelEntry).withCloseable { stream ->
+                    byte[] buffer = new byte[65536]
+                    int count
+                    while ((count = stream.read(buffer)) != -1) baselineModelDigest.update(buffer, 0, count)
+                }
+                if (baselineModelDigest.digest().encodeHex().toString() != selectedQnnDigest) {
+                    throw new GradleException('Native baseline active QNN model hash mismatch')
+                }
+                def entry = archive.getEntry('lib/arm64-v8a/libvisionforge_qnn_htp.so')
+                if (entry == null) throw new GradleException('Native baseline library is absent')
+                archive.getInputStream(entry).withCloseable { source ->
+                    destination.withOutputStream { target -> target << source }
+                }
+            } finally { archive.close() }
+        }
+    }
+    tasks.named('preBuild').configure { dependsOn(stageNativeBaseline) }
+}
+android {
+    namespace 'com.visionforge.inferencebenchmark'
+    compileSdk 35
+    testBuildType 'release'
+    defaultConfig {
+        applicationId 'com.visionforge.mobile.local'
+        minSdk 29
+        targetSdk 35
+        versionCode 65
+        versionName '1.5.14-far-snap'
+        testInstrumentationRunner 'com.visionforge.inferencebenchmark.OverwatchBenchmark'
+        manifestPlaceholders.benchmarkTargetProcess = project.hasProperty('headlessBenchmark') ?
+                'com.visionforge.mobile.local:benchmark' : 'com.visionforge.mobile.local'
+        buildConfigField 'String', 'QNN_HTP_ARCHITECTURES', '"v75"'
+        buildConfigField 'String', 'QNN_MODEL_SHA256', '"' + selectedQnnDigest + '"'
+        if (nativeBaselinePath == null) { externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++20'
+                arguments "-DQNN_SDK_ROOT=${qnnHeaders.absolutePath.replace('\\','/')}",
+                        "-DONNXRUNTIME_ANDROID_AAR=${ortAar.absolutePath.replace('\\','/')}"
+            }
+        } }
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes {
+        debug { }
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+    }
+    if (nativeBaselinePath == null) {
+        externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
+    } else {
+        sourceSets.main.jniLibs.srcDir(nativeBaselineDir)
+    }
+    packaging { jniLibs { useLegacyPackaging = false } }
+    buildFeatures { buildConfig = true }
+}

@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Overwatch local diagnostics" />
+    <instrumentation android:name="com.visionforge.inferencebenchmark.OverwatchBenchmark"
+        android:targetPackage="com.visionforge.mobile.local"
+        android:targetProcesses="${benchmarkTargetProcess}" />
+</manifest>

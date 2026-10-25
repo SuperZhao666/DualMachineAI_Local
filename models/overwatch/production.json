@@ -1,0 +1,81 @@
+{
+  "selected_model": {
+    "name": "ow_m_640",
+    "size": 640,
+    "anchors": 8400,
+    "classes": 1,
+    "source": "models/overwatch/source/ow/yang0828_v11m_640.onnx",
+    "source_sha256": "f81cac625b52baaac08f37d961a20d4aeb47a50a4b4e67ba71e3b91f3594469e",
+    "split_sha256": "9c6e86cf5a04a33c8a53c4a506ece371c67d350af65568b00b8af74d4e9630fe",
+    "split_bytes": 80428634,
+    "metadata": {
+      "description": "Ultralytics YOLO11m model trained on E:\\tu\\YOLO_Platform_V2_CUDA128\\workspace\\datasets\\ds_20260723_220421_c4e1c1f5\\data.yaml",
+      "author": "Ultralytics",
+      "date": "2026-08-01T18:34:17.793350",
+      "version": "8.4.48",
+      "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+      "docs": "https://docs.ultralytics.com",
+      "stride": "32",
+      "task": "detect",
+      "batch": "1",
+      "imgsz": "[640, 640]",
+      "names": "{0: 'item'}",
+      "args": "{'batch': 1, 'half': True, 'dynamic': False, 'simplify': True, 'opset': None, 'nms': False}",
+      "channels": "3",
+      "end2end": "False"
+    },
+    "qnn_library": "libow_m_640_w8a16.so",
+    "qnn_sha256": "7b650a9b885a28863370c9b988a8e16f63cf2a8c2a6775de087ca1c47554a8c4"
+  },
+  "runtime": "QNN HTP v75 W8A16 / U16 input / FP32 split outputs",
+  "device": "Xiaomi 14 Pro SM8650",
+  "app_version": "1.5.11-low-age",
+  "capture_region": {
+    "width": 640,
+    "height": 640,
+    "coordinates": "centered physical desktop pixels",
+    "transport_width": 640,
+    "transport_height": 640
+  },
+  "head_location": "geometric estimate at box y=0.18; not trained head localization",
+  "status": "installed_low_age_candidate_waiting_gameplay_test",
+  "archive_audit": "audit/model640-20261022/model-input-audit.json",
+  "quantization": {
+    "calibration": "audit/model640-20261022/corpus.json",
+    "calibration_frames": 40,
+    "validation_frames": 40,
+    "roles_use_different_videos": true,
+    "numeric_report": "audit/model640-20261022/numeric-comparison.json",
+    "selection_reason": "Restore the previously deployed reference W8A16 graph after the user reported substantially worse gameplay jitter on 1.5.3. CLI numerical agreement and fake-sink pipeline validation did not establish gameplay stability.",
+    "precision_token": "W8A16",
+    "weight_bits": 8,
+    "backbone_activation_bits": 16,
+    "head_activation_bits": 16,
+    "stride_constant_bits": 16,
+    "input_bits": 16,
+    "output_dtype": "FP32",
+    "sdk": "QAIRT 2.37.1.250807"
+  },
+  "control_coordinates": {
+    "space": "physical_screen_roi_pixels",
+    "width": 640,
+    "height": 640,
+    "model_to_control_scale": 1.0,
+    "sensitivity_unit": "screen_pixels_per_hid_count"
+  },
+  "portable_model_bundled": false,
+  "portable_model_scope": "This APK runs the bundled QNN HTP graph on the supported Xiaomi phone; split ONNX is retained in the source package for conversion/reference validation, not bundled as a portable runtime asset.",
+  "user_acceptance_met": false,
+  "active_pixel_projection_enabled": false,
+  "current_validation": "audit/iteration-161-20261024/offline-validation.json",
+  "rollback": {
+    "reason": "user_reported_1.5.3_gameplay_jitter_regression",
+    "rejected_version": "1.5.3-mixed640",
+    "rejected_model_sha256": "93840b810171461214f92af62891ed0b377f1df4f4467004f23891e33dab2415",
+    "native_baseline_apk": "dist/previous/VisionForge-Local-1.5.2.apk",
+    "native_baseline_apk_sha256": "b89a742a28dc3ed6a04164290cc2865c79dd52054851b65ab224b0bf8e61b405",
+    "scope": "Historical 1.5.4 restore only. The 1.5.5 candidate rebuilds native code from source with control-selection diagnostics and short report locks; it does not reuse the baseline native binary."
+  },
+  "candidate_scope": "Warm fresh-ready admission and bounded near-ready preprocessing handoff. Original graph/native640/reference calibration/Core-Servo-Pending mathematics retained. Small short-replay age improvement, physical stop-start not yet accepted.",
+  "current_deployment": "audit/iteration-161-20261024/delivery-current.json"
+}

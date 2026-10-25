@@ -1,0 +1,16 @@
+build/
+dist/
+**/.gradle/
+**/.cxx/
+**/build/
+**/local.properties
+*.pdb
+*.jks
+*.keystore
+*.apk
+*.aab
+*.exe
+*.obj
+*.sqlite
+*.zip
+owner_secrets/
