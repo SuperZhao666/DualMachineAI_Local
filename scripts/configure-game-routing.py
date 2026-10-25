@@ -3,6 +3,7 @@ from pathlib import Path
 import copy, datetime, hashlib, http.client, json, re, shutil, subprocess, sys
 import urllib.parse
 import yaml
+from file_transaction import commit_files
 
 sys.stdout.reconfigure(encoding="utf-8")
 HOME = Path.home() / "AppData/Roaming/io.github.clash-verge-rev.clash-verge-rev"
@@ -132,22 +133,26 @@ def apply():
     assert api("GET", "/configs")["mode"] == "global"
     assert api("GET", "/proxies")["proxies"]["GLOBAL"]["now"] == state["default_group"]
     config = read(HOME / "config.yaml"); config["mode"] = "rule"
-    # Persist the extension without switching subscriptions or changing any upstream credentials.
-    shutil.copy2(backup / "candidate-script.js", HOME / state["script_relative"])
-    write_yaml(HOME / "config.yaml", config)
-    shutil.copy2(backup / "candidate.yaml", HOME / "clash-verge.yaml")
-    shutil.copy2(backup / "candidate.yaml", HOME / "clash-verge-check.yaml")
-    try:
+    reload_attempted = False
+    def reload_and_verify():
+        nonlocal reload_attempted
+        reload_attempted = True
         api("PUT", "/configs", {"path": str(HOME / "clash-verge.yaml")})
         assert api("GET", "/configs")["mode"] == "rule"
         actual = api("GET", "/rules")["rules"]
         assert actual[-1]["type"] == "Match" and actual[-1]["proxy"] == state["default_group"]
-    except Exception:
-        for relative in ["config.yaml", "clash-verge.yaml", "clash-verge-check.yaml", state["script_relative"]]:
-            shutil.copy2(backup / relative, HOME / relative)
-        api("PUT", "/configs", {"path": str(HOME / "clash-verge.yaml")})
-        raise
-    state["status"] = "applied"; state["applied_at"] = datetime.datetime.now().isoformat(); save(state)
+        state["status"] = "applied"
+        state["applied_at"] = datetime.datetime.now().isoformat()
+        save(state)
+    def reload_restored():
+        if reload_attempted:
+            api("PUT", "/configs", {"path": str(HOME / "clash-verge.yaml")})
+    commit_files([
+        (HOME / state["script_relative"], backup / "candidate-script.js"),
+        (HOME / "config.yaml", yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode('utf-8')),
+        (HOME / "clash-verge.yaml", backup / "candidate.yaml"),
+        (HOME / "clash-verge-check.yaml", backup / "candidate.yaml"),
+    ], after_commit=reload_and_verify, after_rollback=reload_restored, callback_paths=[AUDIT])
     print("Applied scoped game routing; original residential default preserved; no existing connections closed.")
 
 def verify():

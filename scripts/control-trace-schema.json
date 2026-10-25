@@ -123,7 +123,8 @@
     "4": "switch confirmation pending",
     "8": "reacquisition requires confirmation",
     "16": "known neighbour extends identity hold",
-    "32": "ranked alternative is previously known"
+    "32": "ranked alternative is previously known",
+    "4096": "current same-owner geometry uncertainty interval; accepted geometry/time and derivatives are not refreshed"
   },
   "velocity_flags": {
     "1": "camera-compensated proposal evaluated",
@@ -609,7 +610,9 @@
         59,
         60,
         61,
-        62
+        62,
+        65,
+        66
       ],
       "meanings": {
         "16384": "valid_large_background_motion_recovered",
@@ -620,7 +623,12 @@
         "Retained code56/59 and current60 Core record background_valid && large_motion_recovered at16384 and do not emit32768; code60 changes capture geometry only, with the same c2336dee53346e814738cf30278e533b03307c22d35932500b9595d25cf9eeae Core producer",
         "audit/iteration-160-20261024/baseline-manifest.json verifies code61 retains all103 native controller sources from code60; only the shared ARM NV12 rounding kernel changes",
         "50..55 and57..58 use the reviewed49..61 release-range contract, not an independently verified binary for every code; unsupported future versions remain unknown",
-        "audit/iteration-161-20261024/baseline.json verifies code62 keeps the same Core/Servo/Pending producer; only pre-inference freshness handoff changes"
+        "audit/iteration-161-20261024/baseline.json verifies code62 keeps the same Core/Servo/Pending producer; only pre-inference freshness handoff changes",
+        "Source audit ecb7c6e/code65 and report fixes code66: MobileControlCore emits16384 only for background_valid_this_frame_ && frame.background.large_motion_recovered;32768 is unassigned. Codes63/64 remain unsupported without retained-source verification."
+      ],
+      "version_codes": [
+        65,
+        66
       ]
     }
   },
@@ -629,5 +637,15 @@
     "unknown": "Retain CSV raw flags unchanged. Semantic totals are null when unresolved rows affect that scope; expose raw set-bit counts, unresolved counts and separately labelled known partial counts.",
     "geometry": "The v6 flag word has no universal geometric-head marker. Use a preceding native_applied model+aim_target profile only as configured geometric/body evidence in reviewed body layouts; do not infer it from16384,32768 or a default geometric_head_ratio.",
     "scope": "This offline interpretation revision does not change the producer v6 fields, diagnostic schema2, Android/Host version, controller or device state."
+  },
+  "response_learning_states": {
+    "0": "warming_up",
+    "1": "invalid_background",
+    "2": "discontinuous_time",
+    "3": "insufficient_excitation",
+    "4": "background_disagreement",
+    "5": "restored_scale_disagreement",
+    "6": "ambiguous_delay",
+    "7": "identified"
   }
 }
